@@ -23,6 +23,26 @@ def numeric(frame, column):
     return pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan).astype(float)
 
 
+def diagnostic_view(frame, config, preserve_priority_sources=True):
+    # CONFIGURATION LOGIC: Only engine-standard roles are gated; arbitrary source columns remain in saved results.
+    if 'transactions' not in config:
+        return frame
+    aliases = {'issuer': ['ISSUER', 'issuer'], 'sector': ['SECTOR', 'sector'],
+               'quantity': ['QUANTITY', 'quantity'], 'prev_quantity': ['PREV_QUANTITY', 'prev_quantity'],
+               'anchor': ['anchor'], 'cpp': ['cpp'], 'rollover_adjustment': ['rollover_adjustment']}
+    roles = config['transactions']
+    if not (roles.get('maturity_years') or roles.get('maturity_date')):
+        aliases['maturity_years'] = ['MATURITY_YEARS', 'YRS_TO_MATURITY', 'maturity']
+    # CORE LOGIC: STEP 1 — Exclude unconfigured metadata from automatic diagnostics without editing saved data.
+    # Input: frame=[{cusip:'X',SECTOR:'Energy',x:1}], configured sector=None.
+    # Output: diagnostic view=[{cusip:'X',x:1}]; the caller's frame still contains SECTOR='Energy'.
+    # Explanation: A field name alone cannot opt a source into sector diagnosis after the user selected None.
+    # Trick: Priority calculation preserves explicitly mapped history/gap fields; standard slices disable that exception.
+    protected = {config.get('priority_history_column'), config.get('priority_cpp_gap_column')} if preserve_priority_sources else set()
+    excluded = [column for role, columns in aliases.items() if roles.get(role) is None for column in columns if column not in protected]
+    return frame.drop(columns=excluded, errors='ignore')
+
+
 def quantity_classes(values):
     # CORE LOGIC: STEP 1 — Preserve the distinction between absent and invalid raw quantity.
     # Input: values=[2,0,None,-1,'bad',inf].
@@ -195,14 +215,32 @@ def _coverage(targets):
     return pd.DataFrame(records)
 
 
+def proxy_discrepancy(targets, config):
+    # CORE LOGIC: STEP 1 — Compare a supplied proxy with the reference anchor in the current benchmark basis.
+    # Input: anchor=[1.00,1.00], rollover_adjustment=[.02,.00], proxy=[1.04,1.04], error_scale=100; adjustment mapped.
+    # Output: current-basis anchors=[.98,1.00], discrepancies approximately [6,4] bps.
+    # Explanation: Subtract the declared offset from the anchor, then convert absolute proxy differences to bps.
+    # Trick: An unmapped source column named rollover_adjustment is ignored; user-precomputed gap columns bypass this function.
+    anchor = numeric(targets, 'anchor')
+    if config.get('transactions', {}).get('rollover_adjustment') is not None:
+        anchor = anchor - numeric(targets, 'rollover_adjustment')
+    return (numeric(targets, 'cpp') - anchor).abs() * config.get('error_scale', 1)
+
+
 def priority_groups(targets, config):
     """Return declared masks and required columns, independent of predictions and gains."""
     # CONFIGURATION LOGIC: Fixed diagnostic slices are independent of model gains and include availability notes.
+    targets = diagnostic_view(targets, config)
+    roles = config.get('transactions')
+    size_field = 'QUANTITY' if roles is None or roles.get('quantity') is not None else None
     maturity = next((c for c in ['MATURITY_YEARS', 'YRS_TO_MATURITY'] if c in targets), None)
+    if roles is not None and not (roles.get('maturity_years') or roles.get('maturity_date')):
+        maturity = None
     history = config.get('priority_history_column')
     if history is None:
-        history = next((c for c in ['prior_trade_count_30d', 'TRADE_COUNTS_PREV_MONTH', 'prior_count'] if c in targets), None)
-    size, term, count = numeric(targets, 'QUANTITY'), numeric(targets, maturity), numeric(targets, history)
+        candidates = ['prior_trade_count_30d'] if 'transactions' in config else ['prior_trade_count_30d', 'TRADE_COUNTS_PREV_MONTH', 'prior_count']
+        history = next((c for c in candidates if c in targets), None)
+    size, term, count = numeric(targets, size_field), numeric(targets, maturity), numeric(targets, history)
     # CORE LOGIC: STEP 1 — Form large, long-maturity and sparse-history masks without imputing unknowns.
     # Input: quantity=[1e6,2e6,2e6],term=[2,.1,NaN],count=[0,14,NaN].
     # Output: large=[True,True,True],long=[True,False,False],sparse=[True,True,False].
@@ -211,28 +249,32 @@ def priority_groups(targets, config):
     large, long = size.ge(1e6), term.gt(1)
     valid_count = count.notna() & count.ge(0) & count.eq(np.floor(count))
     sparse = valid_count & count.le(14)
-    groups = [('All', pd.Series(True, index=targets.index), []), ('>=1MM', large, ['QUANTITY']),
-              ('>=1MM & maturity>1y', large & long, ['QUANTITY', maturity]),
-              ('Prior count 0-14', sparse, [history]), ('>=1MM & prior count 0-14', large & sparse, ['QUANTITY', history]),
-              ('>=1MM & prior count 0-14 & maturity>1y', large & sparse & long, ['QUANTITY', history, maturity])]
+    groups = [('All', pd.Series(True, index=targets.index), []), ('>=1MM', large, [size_field]),
+              ('>=1MM & maturity>1y', large & long, [size_field, maturity]),
+              ('Prior count 0-14', sparse, [history]), ('>=1MM & prior count 0-14', large & sparse, [size_field, history]),
+              ('>=1MM & prior count 0-14 & maturity>1y', large & sparse & long, [size_field, history, maturity])]
     # CONFIGURATION LOGIC: Choose declared discrepancy or canonical levels; both require a spread/bps contract.
     spread = config.get('value_kind', 'spread') == 'spread' and config.get('unit', 'bps') == 'bps'
     gap_column = config.get('priority_cpp_gap_column')
     cpp_fields = [gap_column] if gap_column is not None else ['cpp', 'anchor']
+    if gap_column is None and config.get('transactions', {}).get('rollover_adjustment') is not None:
+        cpp_fields.append('rollover_adjustment')
     cpp_available = spread and all(c in targets for c in cpp_fields)
+    if roles is not None and gap_column is None:
+        cpp_available &= roles.get('cpp') is not None and roles.get('anchor') is not None
     # CORE LOGIC: STEP 2 — Apply declared spread-scale discrepancy thresholds without calling the anchor bad.
     # Input: priority_cpp_gap_column='gap_bps', gap_bps=[5,10,10.01,NaN], quantities all 2MM, error_scale=100.
     # Output: >5 selects [False,True,True,False]; >10 selects [False,False,True,False].
-    # Explanation: Explicit discrepancies are already bps; otherwise abs(cpp-anchor)*error_scale is used.
+    # Explanation: Explicit discrepancies are already bps; otherwise the proxy is compared with the adjusted anchor.
     # Trick: No re-scaling, anchor reconstruction or row fallback changes explicit gap values or exact boundaries.
     if gap_column is None:
-        gap = (numeric(targets, 'cpp') - numeric(targets, 'anchor')).abs() * config.get('error_scale', 1)
+        gap = proxy_discrepancy(targets, config)
     else:
         gap = numeric(targets, gap_column).abs()
     for cutoff in [5, 10]:
         selected = large & gap.gt(cutoff) if cpp_available else pd.Series(False, index=targets.index)
-        groups.extend([(f'>=1MM & CPP gap>{cutoff}bps', selected, ['QUANTITY', *cpp_fields]),
-                       (f'>=1MM & CPP gap>{cutoff}bps & maturity>1y', selected & long, ['QUANTITY', maturity, *cpp_fields])])
+        groups.extend([(f'>=1MM & CPP gap>{cutoff}bps', selected, [size_field, *cpp_fields]),
+                       (f'>=1MM & CPP gap>{cutoff}bps & maturity>1y', selected & long, [size_field, maturity, *cpp_fields])])
     return groups, history, cpp_available
 
 
@@ -346,7 +388,9 @@ def diagnostic_tables(tx, quotes, events, features, config=None):
     if not required_tx.issubset(tx) or not required_quotes.issubset(quotes):
         raise ValueError('Diagnostics need canonical transactions and raw quote fields.')
     options = settings(config)
-    universe, targets, event_rows = _universe(tx), _aligned_features(tx, features), _event_view(events)
+    tx = diagnostic_view(tx, options)
+    universe = _universe(diagnostic_view(tx, options, preserve_priority_sources=False))
+    targets, event_rows = _aligned_features(tx, features), _event_view(events)
     # CORE LOGIC: STEP 1 — Restrict quote diagnostics to the traded universe while auditing excluded records.
     # Input: transaction bonds=[X,Y]; quote bonds=[X,X,Z]; events have X/Z.
     # Output: in-universe quote rows=2,outside-universe rows=1; retained events belong to X.
@@ -379,9 +423,14 @@ def diagnostic_tables(tx, quotes, events, features, config=None):
                   event_quality=_numeric_summary(event_rows, ['rows', 'repeats', 'candidate_count', 'positive_quantity_count', 'gap']),
                   target_coverage=_coverage(targets), pair_sources=_numeric_summary(targets, pair_fields + side_fields),
                   feature_availability=_numeric_summary(targets, [c for c in targets if c.startswith('bcq_')]),
-                  priority_support=_priority_support(targets, options), maturity_support=_maturity_support(targets),
+                  priority_support=_priority_support(targets, options),
+                  maturity_support=_maturity_support(diagnostic_view(targets, options, preserve_priority_sources=False)),
                   history_coverage=_numeric_summary(targets, ['prior_trade_count_30d', 'history_days_available', 'history_30d_complete']),
                   cases=_cases(event_rows, options.get('case_seed', 2026)))
+    # REPORTING LOGIC: An omitted mapping disables its standard summary instead of creating a guessed group.
+    for name in ['sector', 'issuer']:
+        if 'transactions' in options and options['transactions'].get(name) is None:
+            tables[name] = pd.DataFrame([dict(supported=False, note=f'No {name} column configured')])
     # ORCHESTRATION LOGIC: Reconstruct only the frozen bounded case queries with the shared pair policies.
     tables.update(_case_pair_tables(targets, event_rows, options))
     return tables

@@ -2,7 +2,7 @@
 """Candidate-set state engine adapted from the audited BondCliQ research.
 
 The internal spread field and _bps suffixes denote the configured numeric quote
-unit. Values may be spreads or prices; no price-to-spread conversion is implied.
+unit. Only spread input is supported; users prepare benchmark-consistent spreads upstream.
 """
 import numpy as np
 import pandas as pd
@@ -206,6 +206,8 @@ def prepare_quote_events(quotes, progress=None):
 def pair_snapshots(events, times, age_min=30, sync_min=1, allow_exact=True, value_kind="spread"):
     """One bond; latest bid/ask per dealer, same configured local day. Cartesian ranges stay set-valued."""
     # VALIDATION LOGIC: Require positive age and nonnegative synchronization tolerance.
+    if value_kind != 'spread':
+        raise ValueError('Only spread quotes are supported; convert source prices upstream.')
     if age_min <= 0 or sync_min < 0: raise ValueError('age_min must be positive and sync_min nonnegative')
     # CORE LOGIC: STEP 1 — Sort and deduplicate query times for one bond
     # Input: events contains only X; times=[10:05,10:00,10:05]; age_min=30,sync_min=1.
@@ -315,17 +317,7 @@ def pair_snapshots(events, times, age_min=30, sync_min=1, allow_exact=True, valu
     # Trick: Matching indices prevent pandas from aligning results to unrelated rows.
     if matches:
         p.loc[p.complete,matched_columns] = pd.DataFrame(matches,index=p.index[p.complete],columns=matched_columns)
-    # CORE LOGIC: STEP 11 — Orient price gaps while preserving original level and midpoint values.
-    # Input: price bid=99, ask=101; raw gap bounds=[-2,-2], matched gap=-2.
-    # Output: gap bounds=[2,2], center/matched gap=2; midpoint remains 100.
-    # Explanation: Spread width is bid-ask, whereas price width is ask-bid; negative width denotes crossing.
-    # Trick: Negation reverses low/high bounds; size matching and raw values are not filtered.
-    if value_kind == "price":
-        for low, high in [("gap_low", "gap_high"), ("matched_gap_low", "matched_gap_high")]:
-            p[low], p[high] = -p[high].copy(), -p[low].copy()
-        p["gap_center"] = -p["gap_center"]
-        p["matched_gap"] = -p["matched_gap"]
-    # CORE LOGIC: STEP 12 — Classify crossing for original and matched candidate sets
+    # CORE LOGIC: STEP 11 — Classify crossing for original and matched candidate sets
     # Input: gap ranges=[0,5],[-5,-1],[-5,5]; fourth pair incomplete.
     # Output: cross=['None','All','Some','Unassessed']; absent positive matches also remain Unassessed.
     # Explanation: Nonnegative low means no crossing; negative high means all combinations cross; straddling zero means some cross.
@@ -334,7 +326,7 @@ def pair_snapshots(events, times, age_min=30, sync_min=1, allow_exact=True, valu
                                   ('_matched','matched_gap_low','matched_gap_high',p.positive_matches.gt(0))]:
         p['cross'+suffix] = 'Unassessed'
         p.loc[eligible,'cross'+suffix] = np.select([p.loc[eligible,lo].ge(0),p.loc[eligible,hi].lt(0)],['None','All'],default='Some')
-    # CORE LOGIC: STEP 13 — Sort pair rows and derive policy eligibility
+    # CORE LOGIC: STEP 12 — Sort pair rows and derive policy eligibility
     # Input: A at10:05 is complete,max_age=2,time_gap=1,positive_matches=1; age_min=30,sync_min=1.
     # Output: A fresh_pair=True,size_time_pair=True; pairs sorted by time,firm.
     # Explanation: Age2<=30, synchronization1<=1 and one positive match satisfy both masks.
@@ -492,6 +484,8 @@ def build_quote_features(quotes, queries, age_min=30, sync_min=1, allow_exact=Tr
     latest incomplete messages still use the full path to preserve n_incomplete.
     """
     # VALIDATION LOGIC: Reject duplicate target identities, missing query keys and invalid age/sync parameters.
+    if value_kind != 'spread':
+        raise ValueError('Only spread quotes are supported; convert source prices upstream.')
     if queries.row_id.duplicated().any() or queries[['row_id','cusip','time']].isna().any().any():
         raise ValueError('Queries require unique row_id and nonmissing cusip/time')
     if age_min <= 0 or sync_min < 0:

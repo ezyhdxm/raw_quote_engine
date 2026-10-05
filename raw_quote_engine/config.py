@@ -22,6 +22,7 @@ class TransactionColumns:
     cpp: str = None
     split: str = None
     actual: str = None
+    rollover_adjustment: str = None
 
     def __post_init__(self):
         # VALIDATION LOGIC: Required mappings must be nonempty column names, not positional indices.
@@ -68,9 +69,8 @@ def _column_names(schema, required):
 class PipelineConfig:
     """Normalize target/anchor/cpp and quotes into compatible units before comparing them.
 
-    target_scale multiplies target, actual, anchor, and cpp; quote_scale multiplies quote values.
-    error_scale subsequently converts prediction errors into unit. Price values remain
-    prices: their canonical storage field is named spread only for event-engine compatibility.
+    target_scale multiplies target, actual, anchor, proxy (cpp), and rollover adjustment;
+    quote_scale multiplies quote spreads. error_scale converts prediction errors into unit.
     quantity_scale applies to transaction sizes; quote_quantity_scale independently
     scales quote sizes into the same unit. State is always same-day.
     """
@@ -81,6 +81,7 @@ class PipelineConfig:
     error_scale: float = 1.0
     unit: str = None
     timezone: str = 'America/New_York'
+    quote_timezone: str = None
     age_min: float = 30.0
     sync_min: float = 1.0
     lookback_min: float = 30.0
@@ -100,14 +101,16 @@ class PipelineConfig:
         # VALIDATION LOGIC: Reject ambiguous units and impossible feature settings before ingesting data.
         if not isinstance(self.transactions, TransactionColumns) or not isinstance(self.quotes, QuoteColumns):
             raise TypeError('Use TransactionColumns and QuoteColumns, or PipelineConfig.from_dict().')
-        if self.value_kind not in {'spread', 'price'}:
-            raise ValueError("value_kind must be 'spread' or 'price'.")
+        if self.value_kind != 'spread':
+            raise ValueError("Only spread input is supported; convert prices upstream and use value_kind='spread'.")
         if self.unit is None:
-            object.__setattr__(self, 'unit', 'bps' if self.value_kind == 'spread' else 'points')
+            object.__setattr__(self, 'unit', 'bps')
         if not isinstance(self.unit, str) or not self.unit.strip():
             raise ValueError('unit must be a nonempty displayed error-unit name.')
         if not isinstance(self.timezone, str) or not self.timezone.strip():
             raise ValueError('timezone must be a named timezone.')
+        if self.quote_timezone is not None and (not isinstance(self.quote_timezone, str) or not self.quote_timezone.strip()):
+            raise ValueError('quote_timezone must be a named timezone or None.')
         if self.priority_history_column is not None and (not isinstance(self.priority_history_column, str) or not self.priority_history_column.strip()):
             raise ValueError('priority_history_column must be a nonempty column name or None.')
         if self.priority_cpp_gap_column is not None and (not isinstance(self.priority_cpp_gap_column, str) or not self.priority_cpp_gap_column.strip()):
@@ -124,16 +127,6 @@ class PipelineConfig:
             raise ValueError('allow_exact and synthetic must be booleans.')
         if isinstance(self.case_seed, bool) or not isinstance(self.case_seed, int) or self.case_seed < 0:
             raise ValueError('case_seed must be a nonnegative integer.')
-
-    @property
-    def bid_prefers_larger(self):
-        # CONFIGURATION LOGIC: Highest bid price corresponds to lowest bid spread; no conversion is guessed.
-        return self.value_kind == 'price'
-
-    @property
-    def ask_prefers_larger(self):
-        # CONFIGURATION LOGIC: Lowest ask price corresponds to highest ask spread.
-        return self.value_kind == 'spread'
 
     def to_dict(self):
         # SERIALIZATION LOGIC: Dataclass mappings and scalar settings form a JSON-compatible CLI contract.

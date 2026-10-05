@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import numpy as np
 import pandas as pd
-from .diagnostics import priority_groups, settings
+from .diagnostics import diagnostic_view, priority_groups, settings
 
 # CONFIGURATION LOGIC: Keep generated evidence and interpretation visibly separate.
 STYLE = '''body{max-width:1200px;margin:36px auto;padding:0 22px;font:16px/1.6 system-ui;color:#193844}
@@ -33,7 +33,7 @@ DESCRIPTIONS = {
     'history_coverage': 'Trailing 30-day observed counts and supplied-history coverage. A complete 30-day time span cannot certify feed completeness; shorter history cannot establish true illiquidity.',
     'cases': 'Four deterministic explanatory roles: one seeded random event, one typical candidate range and up to two widest ranges. A repeated event can serve multiple roles. High range is not demonstrated model harm. These local rows contain private identifiers.',
     'case_pair_queries': 'At most eighteen frozen transaction queries chosen by seeded random, typical absolute gap and high absolute gap roles; overlapping identities are deduplicated. Selection never uses target labels or model errors.',
-    'case_pair_policy': 'Case-only paired calculator: A uses fresh original slots; B selects match-eligible slots but retains original candidates; C matches positive quantities on exactly those B slots. B and C have identical counts. Gap/level units are canonical value units, including declared price orientation.',
+    'case_pair_policy': 'Case-only paired calculator: A uses fresh original slots; B selects match-eligible slots but retains original candidates; C matches positive quantities on exactly those B slots. B and C have identical counts. Gaps are bid spread minus ask spread in canonical spread units.',
     'case_pair_effect': 'Case-only differences: A-to-B is a support-selection change; B-to-C is same-slot quantity matching. This isolates the arithmetic policy effect but does not establish causal size effects or population benefit. No matching support produces an unknown difference.',
 }
 
@@ -79,7 +79,8 @@ def comparison_priorities(comparison, config=None):
     # SETUP LOGIC: Reuse the independent comparison engine; this path calls no estimators.
     from bond_pricer import compare_predictions
     options = settings(config)
-    groups, history, cpp_available = priority_groups(comparison.data, options)
+    declared = diagnostic_view(comparison.data, options)
+    groups, history, cpp_available = priority_groups(declared, options)
     output = []
     for name, mask, required in groups:
         # CORE LOGIC: STEP 1 — Apply the same group mask to both models before recomputing losses.
@@ -87,7 +88,7 @@ def comparison_priorities(comparison, config=None):
         # Output: >=1MM has n=1,reference_mae=4,candidate_mae=3,mae_improvement_pct=25.
         # Explanation: The small trade contributes to neither side of the large-trade comparison.
         # Trick: Filtering the input population recomputes coverage; percentiles are never subtracted across overlapping cohorts.
-        supported = all(c is not None and c in comparison.data for c in required) and ('CPP' not in name or cpp_available)
+        supported = all(c is not None and c in declared for c in required) and ('CPP' not in name or cpp_available)
         subset = comparison.data.loc[mask] if supported else comparison.data.iloc[:0]
         result = compare_predictions(subset, **comparison.config)
         record = result.summary(min_count=options.get('selection_min_count', 30)).iloc[0].to_dict()
@@ -99,8 +100,9 @@ def comparison_priorities(comparison, config=None):
 def _comparison_section(output, label, comparison, index, config):
     # CONFIGURATION LOGIC: Canonical maturity and rolling-history names are explicit additions to generic defaults.
     from bond_pricer import Slice, default_slices
-    slices = default_slices(comparison.data.columns)
-    maturity = next((name for name in ['MATURITY_YEARS', 'YRS_TO_MATURITY'] if name in comparison.data), None)
+    declared = diagnostic_view(comparison.data, config, preserve_priority_sources=False)
+    slices = default_slices(declared.columns)
+    maturity = next((name for name in ['MATURITY_YEARS', 'YRS_TO_MATURITY'] if name in declared), None)
     if maturity and not any(item.column == maturity for item in slices):
         slices.append(Slice(maturity, [-np.inf, 0, .25, 1, 3, 5, 10, np.inf], name='Remaining maturity'))
     if 'prior_trade_count_30d' in comparison.data:
@@ -108,7 +110,7 @@ def _comparison_section(output, label, comparison, index, config):
     # CONFIGURATION LOGIC: Fixed interactions are offered only when both actual metadata fields exist.
     size = next((item for item in slices if item.column == 'QUANTITY'), None)
     interactions = []
-    if size is not None and 'SECTOR' in comparison.data:
+    if size is not None and 'SECTOR' in declared:
         interactions.append((Slice('SECTOR', top_n=12), size))
     if size is not None and maturity:
         interactions.append((next(item for item in slices if item.column == maturity), size))
@@ -193,14 +195,21 @@ def write_report(out, tables, comparisons=None, metadata=None):
     if synthetic is None:
         source = 'Input provenance unspecified — interpret only after verifying the supplied data'
     intro = f'<h1>Raw quote research run</h1><p class="note warning">{escape(source)}</p>'
-    intro += '<p>Every numerical table and figure in this report is generated from this run\'s supplied data, computed diagnostics and comparison objects. No historical BondCliQ result is inserted as a new result.</p>'
+    intro += '<p>Every numerical table and figure in this report is generated from this run\'s supplied data, computed diagnostics and comparison objects.</p>'
     intro += '<p>Read coverage first, then event ambiguity, pair/age conditions, fixed cases and model comparisons. All-target coverage and paired-model accuracy answer different questions.</p>'
     intro += _decision(metadata) + _test_summary(comparisons, metadata.get('selection', {}).get('selected'))
     # REPORTING LOGIC: Unit and timing contracts are explicit; interpretation cannot be inferred from column names.
     contract = {name: config.get(name, 'not supplied') for name in ['value_kind', 'unit', 'quote_scale', 'target_scale',
-                'error_scale', 'quantity_scale', 'quote_quantity_scale', 'timezone', 'allow_exact', 'age_min', 'sync_min', 'lookback_min', 'case_seed']}
+                'error_scale', 'quantity_scale', 'quote_quantity_scale', 'timezone', 'quote_timezone', 'allow_exact', 'age_min', 'sync_min', 'lookback_min', 'case_seed']}
     intro += '<details><summary>Declared unit, timing and case-selection contract</summary><pre>' + escape(json.dumps(contract, indent=2)) + '</pre></details>'
-    intro += '<p>Quotes and target/anchor levels must share canonical units after input scaling. Error scale converts their differences to the displayed error unit. Raw quality ranges are in canonical value units; age fields are minutes. The legacy field name <code>spread</code> can store declared price values without converting them to spreads.</p>'
+    intro += '<p>Only spread input is supported. Quotes and target/anchor levels must share canonical units after input scaling. Error scale converts prediction errors to the displayed unit. Raw quality ranges are in canonical spread units; age fields are minutes.</p>'
+    # REPORTING LOGIC: State the configured reconstruction rule and distinguish prepared labels from predictions.
+    roles = config.get('transactions', {})
+    delta = metadata.get('training', {}).get('target_mode') == 'delta'
+    formula = 'prediction = model output + anchor - rollover adjustment' if delta else 'prediction = model output'
+    adjustment = roles.get('rollover_adjustment') or 'not supplied (zero)'
+    truth = roles.get('actual') or ('target + anchor - rollover adjustment' if delta else 'target')
+    intro += '<p>' + escape(formula) + '; adjustment source: <code>' + escape(adjustment) + '</code>; scoring truth: <code>' + escape(truth) + '</code>. The supplied training target is never rewritten.</p>'
     # FILE IO LOGIC: Export every supplied diagnostic table, preserving empty and unsupported groups.
     sections, manifest = [], []
     for index, (name, table) in enumerate(tables.items(), 1):
@@ -222,12 +231,13 @@ def write_report(out, tables, comparisons=None, metadata=None):
     limits = '''<section><h2>Interpretation limits</h2><ul>
 <li>Known time controls availability. Original event timestamps do not justify using a record before receipt; exact-time inclusion follows the declared setting. Same-day resets prevent overnight carry-forward.</li>
 <li>Duplicates, multi-price states, zeros, negative values and crossing are observations to diagnose. They are not automatic deletion rules. A median between candidates is a statistic, not necessarily an executable quote.</li>
-<li>Crossing orientation depends on spread versus price. A positive/negative target-level mean gap does not identify every dealer pair. Synchronization and size matching change the eligible population; compare the same slots before attributing an effect.</li>
+<li>Spread width is bid spread minus ask spread; negative width denotes crossing. A positive/negative target-level mean gap does not identify every dealer pair. Synchronization and size matching change the eligible population; compare the same slots before attributing an effect.</li>
 <li>Quote quantity units and transaction par units need independent confirmation. Size matching is equality of supplied positive labels, not an estimated size curve. Current quantity, prior trade quantity and quote quantity are distinct fields.</li>
 <li>Message age and real-change age summarize different dealer histories and may have different assessable samples. A zero single-dealer dispersion is not consensus. No peer-supported side or fresh pair does not mean no quotes exist.</li>
-<li>Low historical trade counts can reflect missing or truncated data. Unknown maturity remains unknown; short-maturity trades remain present. CPP discrepancy is abs(cpp-anchor) times the declared error scale; no unconfigured yield offset or side adjustment is inferred, and discrepancy does not certify a bad anchor.</li>
+<li>Low historical trade counts can reflect missing or truncated data. Unknown maturity remains unknown; short-maturity trades remain present. Reference-proxy discrepancy uses proxy minus (anchor minus configured rollover adjustment), then the declared error scale, unless an explicit discrepancy column is supplied. No source selection or missing-row proxy fallback is inferred. Discrepancy does not certify a bad anchor.</li>
+<li>Rollover adjustment changes delta reconstruction and the anchor basis; it does not rebuild targets, rewrite base features or infer benchmark changes across the raw quote history. Users must prepare comparable spread definitions and point-in-time inputs.</li>
 <li>Common-dealer direction and other-bond issuer movement require valid support; changing dealers, quantities or donors can alter aggregate levels. They do not fit or identify a latent dealer/bond factor model.</li>
-<li>The supplied baseline feature schema, target and anchor define this run. They are not automatically the historical BASE14 specification. Baseline context may already contain issuer, quantity or previous-trade information; compare incremental families on identical rows.</li>
+<li>The supplied baseline feature schema, categorical list, target and anchor define this run. No trade-context category or base feature is generated implicitly. Baseline context may already contain issuer, quantity or previous-trade information; compare incremental families on identical rows.</li>
 <li>Validation selection must precede final Test evaluation. This report does not certify an unexposed Test or choose a candidate from Test. Inspect split/selection/exposure provenance. LODO is descriptive removal of saved dates, not retraining, a confidence interval or significance.</li>
 <li>Local fixed-case CSVs may contain private dealer/bond identifiers. The generic comparison export is aggregate, but diagnostic bond/dealer tables and cases require review before sharing. No data from this run belongs in the shipped source repository by default.</li>
 </ul></section>'''

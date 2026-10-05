@@ -115,7 +115,7 @@ def _transaction_mappings(columns):
     optional = {'ISSUER': columns.issuer, 'SECTOR': columns.sector, 'QUANTITY': columns.quantity,
                 'PREV_QUANTITY': columns.prev_quantity, 'MATURITY_YEARS': columns.maturity_years,
                 'MATURITY_DATE': columns.maturity_date, 'anchor': columns.anchor, 'cpp': columns.cpp,
-                'actual': columns.actual, 'split': columns.split}
+                'actual': columns.actual, 'split': columns.split, 'rollover_adjustment': columns.rollover_adjustment}
     mappings.update({name: source for name, source in optional.items() if source is not None})
     if columns.maturity_date is not None and columns.maturity_years is None:
         mappings['MATURITY_YEARS'] = None
@@ -162,14 +162,18 @@ def normalize_transactions(data, config):
     # Input: target=[1.2,'bad',0], actual=[2,3,None], quantity=[1000,None,0], target_scale=100, quantity_scale=1000.
     # Output: target=[120,NaN,0], actual=[200,300,NaN], QUANTITY=[1000000,NaN,0]; all three trades remain.
     # Explanation: A missing label prevents supervised fitting for that trade, not its use in time-causal metadata.
-    # Trick: The same target scale applies to actual/anchor/cpp; an explicit actual is never inferred from target.
+    # Trick: The same target scale applies to actual/anchor/cpp/rollover_adjustment; target is supplied unchanged apart from scaling.
     frame['target'] = _number(original[columns.target], config.target_scale)
     numeric = {'QUANTITY': columns.quantity, 'PREV_QUANTITY': columns.prev_quantity,
-               'actual': columns.actual, 'anchor': columns.anchor, 'cpp': columns.cpp, 'MATURITY_YEARS': columns.maturity_years}
+               'actual': columns.actual, 'anchor': columns.anchor, 'cpp': columns.cpp,
+               'rollover_adjustment': columns.rollover_adjustment, 'MATURITY_YEARS': columns.maturity_years}
     for destination, source in numeric.items():
         if source is not None:
-            scale = config.quantity_scale if 'QUANTITY' in destination else (config.target_scale if destination in {'actual', 'anchor', 'cpp'} else 1.)
+            scale = config.quantity_scale if 'QUANTITY' in destination else (config.target_scale if destination in {'actual', 'anchor', 'cpp', 'rollover_adjustment'} else 1.)
             frame[destination] = _number(original[source], scale)
+    # VALIDATION LOGIC: An explicit rollover series must be complete; unknown adjustments never become zero.
+    if columns.rollover_adjustment is not None and frame.rollover_adjustment.isna().any():
+        raise ValueError('Configured rollover_adjustment must be finite for every transaction; preprocess missing values explicitly.')
     # CORE LOGIC: STEP 3 — Add declared grouping metadata and maturity without inventing missing groups.
     # Input: issuer=[' ACME ',None], sector=['TMT',''], no maturity mapping or split mapping.
     # Output: ISSUER=['ACME',<NA>], SECTOR=['TMT',<NA>]; existing source columns remain present.
@@ -188,7 +192,8 @@ def normalize_transactions(data, config):
     diagnostics = dict(input_rows=len(frame), output_rows=len(frame), excluded_rows=0, invalid_key_rows=0,
                        invalid_target_rows=int(frame.target.isna().sum()), generated_row_ids=columns.id is None,
                        bonds=int(frame.cusip.nunique()), timezone=config.timezone, value_kind=config.value_kind,
-                       target_scale=config.target_scale, error_scale=config.error_scale, unit=config.unit)
+                       target_scale=config.target_scale, error_scale=config.error_scale, unit=config.unit,
+                       rollover_adjustment_source=columns.rollover_adjustment)
     diagnostics['unknown_quantity_rows'] = int((frame.QUANTITY.isna() | frame.QUANTITY.le(0)).sum()) if columns.quantity else len(frame)
     diagnostics['maturity_source'] = 'supplied_years' if columns.maturity_years else ('calendar_days/365.25' if columns.maturity_date else 'unavailable')
     frame.attrs['normalization'] = diagnostics.copy()
@@ -203,8 +208,9 @@ def _quote_rows(frame, columns, config):
     # Trick: keep='first' preserves a deterministic representative; duplicate status precedes normalization.
     duplicates = frame.duplicated(keep='first')
     source_ids = frame[columns.source_id] if columns.source_id else pd.Series(np.arange(len(frame)), index=frame.index)
+    known_times = _times(frame[columns.known_time], config.quote_timezone or config.timezone, 'quote known_time').dt.tz_convert(config.timezone)
     common = pd.DataFrame({'firm': _identifier(frame[columns.dealer]), 'cusip': _identifier(frame[columns.bond]),
-                           'quote_timestamp_ET': _times(frame[columns.known_time], config.timezone, 'quote known_time'),
+                           'quote_timestamp_ET': known_times,
                            'raw_source_id': source_ids, 'source_duplicate': duplicates})
     if columns.original_timestamp is not None:
         common['original_timestamp'] = frame[columns.original_timestamp]
@@ -245,10 +251,8 @@ def normalize_quotes(data, config, transactions):
     identifiers = [name for name in [columns.bond, columns.dealer, columns.source_id] if name]
     frame = read_frame(data, identifiers).reset_index(drop=True)
     _required(frame, columns)
-    mappings = {'firm': columns.dealer, 'cusip': columns.bond, 'quote_timestamp_ET': columns.known_time,
-                'side': columns.side, 'spread': columns.value, 'quantity': columns.quantity,
-                'raw_source_id': columns.source_id, 'source_duplicate': None, 'quantity_kind': None, 'quantity_raw': None}
-    _reserved(frame, mappings)
+    # SCHEMA LOGIC: Quote output is a new table; unused source aliases cannot activate roles or conflict.
+    # An unmapped source 'quantity' is ignored, so output quantity stays missing; the source is unchanged.
     rows = _quote_rows(frame, columns, config)
     # CORE LOGIC: STEP 1 — Restrict to traded bonds and valid event keys using the recorded known time.
     # Input: transaction cusip=['A']; quotes cusip=['A','B','A'], firm=['D','D',None], side=['bid','bid','ask'].
@@ -266,9 +270,10 @@ def normalize_quotes(data, config, transactions):
                        invalid_value_rows=int(kept.spread.isna().sum()),
                        unknown_quantity_rows=int((kept.quantity.isna() | kept.quantity.le(0)).sum()),
                        zero_value_rows=int(kept.spread.eq(0).sum()), negative_value_rows=int(kept.spread.lt(0).sum()),
-                       timezone=config.timezone, value_kind=config.value_kind, quote_scale=config.quote_scale,
+                       timezone=config.timezone, quote_timezone=config.quote_timezone or config.timezone,
+                       value_kind=config.value_kind, quote_scale=config.quote_scale,
                        quote_quantity_scale=config.quote_quantity_scale, time_source=columns.known_time,
                        original_timestamp_used_for_state=False, same_day_state=True,
-                       limitation='Source diagnostic reasons may overlap; quotes are not converted between price and spread.')
+                       limitation='Source diagnostic reasons may overlap; prices must be converted to spreads upstream.')
     kept.attrs['normalization'] = diagnostics.copy()
     return kept, diagnostics

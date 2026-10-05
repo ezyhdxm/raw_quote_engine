@@ -48,6 +48,7 @@ def run_file(path, evaluate_test=False):
         return path.parent/Path(value).expanduser()
     return run_research(resolve(specification['transactions_path']), resolve(specification['quotes_path']),
                         specification['base_features'], specification.get('model_params', {}), specification['config'],
+                        base_cat_features=specification.get('base_cat_features', []),
                         output=resolve(specification.get('output', 'runs/research')),
                         training=TrainingConfig(**specification.get('training', {})), evaluate_test=evaluate_test)
 

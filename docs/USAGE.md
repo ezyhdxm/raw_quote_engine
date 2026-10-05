@@ -1,83 +1,117 @@
-# Reproducing a report from raw data
+# From prepared DataFrames to a research report
 
-For the existing BondCliQ/data_ig setup, use the [ready BondCliQ example](BONDCLIQ_EXAMPLE.md) and [its notebook](../bondcliq_research.ipynb). Only the two input paths are required; the preset supplies the original baseline and LightGBM settings. The generic mapping workflow below is for other datasets or intentionally different experiments.
+The primary interface is an editable notebook form. It takes a transaction DataFrame, raw spread-quote DataFrame, ordered `BASE_FEATURES`, explicit `BASE_CAT_FEATURES` and `LGB_PARAMS`. The engine starts with these supplied definitions; production feature construction and source-specific preprocessing stay outside it.
 
-## 1. Install
+For the existing BondCliQ/data_ig setup, open [bondcliq_research.ipynb](../bondcliq_research.ipynb) and follow [BONDCLIQ_EXAMPLE.md](BONDCLIQ_EXAMPLE.md). For other sources, open [raw_quote_research.ipynb](../raw_quote_research.ipynb).
 
-Download this repository as ZIP or clone it. Open a terminal in the extracted directory and run `python -m pip install -e ".[notebook]"`. Python 3.10+ is required. A separate virtual environment is recommended. On systems where LightGBM requires an OpenMP runtime, use a working LightGBM installation before starting a long run.
+## 1. Install and prepare
 
-The notebook and CLI call the same public pipeline. The `demo` command needs no user data; its report is labelled synthetic throughout.
+Download the repository ZIP or clone it. From its directory, run `python -m pip install -e ".[notebook]"`. Python 3.10+ and a working LightGBM installation are required. Use the same environment for the notebook kernel.
 
-## 2. Map inputs once
+Read your inputs into DataFrames using your existing loader. Supply baseline features that are available at prediction time. Prepare identifiers, sector/issuer metadata, proxy levels, units, quantity multipliers and benchmark conventions upstream. The engine does not fetch a sector map, create a CPP proxy or convert prices to spreads. Only spread-valued quote input is supported.
 
-Copy `examples/config.json`. Set transaction and quote file paths, base feature names, model parameters, and source column mappings. Relative paths are resolved beside the JSON file, including output paths. Use CSV or Parquet, or pass pandas DataFrames directly in the notebook.
+The optional CLI accepts CSV/Parquet paths. CSV identities mapped by the engine are read as strings to preserve leading zeros. If you read CSVs yourself, explicitly preserve your identity columns' dtype.
 
-Essential choices are target column, bond ID, prediction time, known quote time, dealer, quote sides/values, and spread-versus-price units. Optional metadata enables more analyses; it is never guessed from an unrelated column. Remove unavailable optional mappings. See [DATA_CONTRACT.md](DATA_CONTRACT.md) for exact meanings.
+## 2. Open the form
 
-For a `data_ig`-style target that is a spread change, map its delta label as `target`, map `PREV_BM_SPREAD` as `anchor`, and set `training.target_mode` to `delta`. Models fit the delta; comparisons reconstruct levels with the same known anchor. Missing delta anchors are an input error. Do not map a delta label as a level merely because their error differences appear similar.
+```python
+# SETUP LOGIC: No data loading or model fitting occurs on import.
+from raw_quote_engine import research_form
+# UI LOGIC: Map required columns and configure optional fields in the displayed form.
+controller = research_form(
+    transactions_df, quotes_df, BASE_FEATURES, BASE_CAT_FEATURES, LGB_PARAMS,
+    output='runs/my_research',
+)
+```
 
-## 3. Run Steps 1–5
+Map the transaction bond ID, prediction time and target; map the quote bond ID, known time, dealer, side/value or bid/ask values. Optional mappings include actual scoring spread, prediction anchor, rollover adjustment, proxy, quantity, issuer, sector, maturity and an explicit split. A configured optional field must exist. Leave its mapping unset when unavailable.
+
+Review the ordered baseline list, its categorical subset, LightGBM parameters, source timezones, scales, date policy and output location. **Validate inputs** performs preflight without training. **Run validation** starts Steps 1–5 after valid settings are accepted. Progress identifies stages and completed work units. `controller.run` is `None` before completion and holds the resulting `ResearchRun` afterward. Notebook Run All only displays the form.
+
+Supply `config=PipelineConfig(...)` and `training=TrainingConfig(...)` to prefill the form. Optionally supply `quote_universe=pd.DataFrame({'cusip': ...})` when the full research universe is wider than eligible modeling transactions. `cache_dir` can place reusable caches in another local folder.
+
+## 3. Target and time contracts
+
+With `target_mode='level'`, models predict the supplied spread label. With `target_mode='delta'`, the supplied target is unchanged, and prediction reconstruction is:
+
+```text
+predicted spread = predicted target + anchor - rollover adjustment
+```
+
+Map a rollover adjustment only if the upstream target has the convention `actual - anchor + adjustment`. If no column is mapped, adjustment is zero. A mapped missing/nonfinite adjustment rejects the run. An explicit `actual` column is the scoring truth and takes precedence over reconstructed labels. For example, predicted target `.03`, anchor `1.00`, adjustment `.02` and actual `1.02` produce spread `1.01` and error `-1 bp` with `error_scale=100`.
+
+This scalar correction does not repair historical benchmark changes across quote timestamps. Source spreads and optional proxy must already share a justified benchmark and scale. The proxy/anchor gap compares the supplied proxy with `anchor - adjustment`; no proxy or fallback source is constructed. See [DATA_CONTRACT.md](DATA_CONTRACT.md).
+
+Naive transaction timestamps use `timezone`; naive quote timestamps use `quote_timezone` when supplied, otherwise `timezone`. Aware timestamps preserve their instants and convert to the state timezone. Known time controls availability; an original vendor timestamp never replaces it. Same-day state never carries overnight.
+
+## 4. Stages and evaluation policy
+
+| Stage | Calculation | Decision supported |
+|---|---|---|
+| 1 | Schema, time, units, universe overlap and population coverage | Whether the feed covers the requested prediction population |
+| 2 | Repeats, exact-event candidates, incomplete states and size status | Whether a message is a refresh, a changed state or an ambiguous event |
+| 3 | Same-day quote levels, reliability, matched-dealer direction, issuer other-bond changes and path history | Which information is available beyond the supplied baseline |
+| 4 | Age, gap, crossing, size and representative-case diagnostics | Which mechanisms need inspection and which comparisons have common support |
+| 5 | Fixed LightGBM families, paired validation losses, selection and saved comparisons | Whether quote features improve the declared cohort and how tails behave |
+
+Default fractions reserve 20% of observed dates for Validation and 20% for Test, with one observed-date embargo before each and at least three training dates. Fixed `validation_dates` and `test_dates` may instead specify counts. `embargo_dates` is before Validation; `test_embargo_dates` controls the Test boundary separately. Explicit input split labels override date allocation, subject to chronological validation. Single dates never straddle stages.
+
+For the short BondCliQ example: `validation_dates=5`, `test_dates=5`, `embargo_dates=2`, `test_embargo_dates=0`, `min_train_dates=10`. On 22 observed weekdays from March 2–31, 2026, Train is March 2–13, embargo March 16–17, Validation March 18–24 and Test March 25–31.
+
+Four families share training rows and parameters: Base, Quote, Quote+Path and Quote+CrossBond. The last adds same-bond matched-dealer and other-bond issuer movements. There is no parameter search or test-dependent early stopping. Transactions without quotes remain. Category vocabularies are learned on Train only; the categorical subset is explicitly supplied.
+
+Selection uses the lowest validation MAE among quote candidates on the declared cohort, with a support-based fallback recorded in `selection.json`. The five-input form defaults to All records. The BondCliQ example selects quantity >=1MM and maturity >1 year; choose this cohort explicitly in the generic form when appropriate. Short maturity and unknown metadata remain separate diagnoses. The 5% practical threshold is not a significance test; overlapping exploratory slices are not independent evidence.
+
+## 5. Programmatic and CLI use
+
+```python
+# SETUP LOGIC: Explicit calls are suitable for batch runs after source preparation and configuration.
+from raw_quote_engine import run_research
+# ORCHESTRATION LOGIC: Start validation with the same input contract as the notebook form.
+run = run_research(
+    transactions_df, quotes_df, BASE_FEATURES, LGB_PARAMS, config,
+    base_cat_features=BASE_CAT_FEATURES, training=training, output='runs/my_research',
+)
+```
+
+For a CLI run, edit [examples/config.json](../examples/config.json), including `base_features` and `base_cat_features`:
 
 ```bash
 python -m raw_quote_engine.cli run --config examples/config.json
 ```
 
-Progress identifies the current stage, elapsed time and completed work units. Event aggregation may initially be indeterminate while pandas groups messages. State progress counts bonds; path progress counts bond/day groups. These counters reflect the work, not independent observations or an estimated completion time.
+Relative input/output paths resolve beside the JSON file. Commands intentionally start work; the notebook form requires its explicit Run action.
 
-| Stage | Calculation | Decision supported |
-|---|---|---|
-| 1 | Schema/time/units, universe overlap, global/sector/issuer/dealer/bond coverage | Whether the raw feed covers the prediction population; which metadata or mappings need repair |
-| 2 | Full-row repeats, exact-event candidate sets, incomplete events, size status and guarded history | Whether an apparent move is a real state change, a refresh, or an ambiguous multi-price/size event |
-| 3 | Same-day state, fresh/decayed quote levels, reliability, matched-dealer direction, issuer other-bond changes, path history | Which quote information is causally available beyond Base; support and missingness |
-| 4 | Pair/crossing/age/size diagnostics, fixed random/typical/high-impact cases, feature availability | Which cases need source inspection and which candidate controls can be compared on identical support |
-| 5 | Fixed LightGBM ablations, same-row validation losses, frozen candidate, saved predictions and slice comparisons | Whether quote features reduce error on the declared business cohort and whether tails deteriorate |
+## 6. Compare and export saved results
 
-Default date fractions are 20% Validation, 20% Test, with one observed-date embargo before each and at least three training dates. A ten-date example becomes Train1–4 / Embargo5 / Validation6–7 / Embargo8 / Test9–10. The two stages never split a single local date. Shorter inputs require smaller fractions/embargo, validation-only `test_fraction=0`, or an explicit chronological split column.
-
-Four model families share the same finite-label training rows and parameters: Base; Quote levels and reliability; Quote+Path; Quote+CrossBond, which adds same-bond dealer direction and other-bond issuer movement. There is no hyperparameter sweep or test early stopping. Transactions without quotes remain. The selected candidate has the lowest validation MAE on the predeclared selection population; ties prefer the earlier simpler family. A minimum-support fallback to all common validation rows is explicit in `selection.json`.
-
-Default selection prioritizes quantity >=1MM and maturity >1 year when both mappings exist. Missing metadata or a small cohort produces a disclosed fallback, not fabricated support. Short maturity remains separately reported. A 5% practical improvement threshold is a decision aid, not a statistical significance claim. Multiple slice results are exploratory and overlap.
-
-## 4. Open and review
-
-Open the output `report.html`. Every numerical result is computed from this run and exported in `tables/` or the comparison assets. The report does not read the old BondCliQ aggregate bundle or contain hand-entered benchmark losses.
-
-In a notebook:
+Open the generated `report.html`. Every numerical result comes from the current run's tables or comparison objects. To review later without source files or refitting:
 
 ```python
-# FILE IO LOGIC: Restore a completed run, without reading raw quote files or fitting models again.
+# FILE IO LOGIC: Restore a trusted completed local run.
 from raw_quote_engine import load_run, Slice
-run = load_run("runs/my_research")
-# UI LOGIC: Switch saved reference/candidate models, filters, one-dimensional slices and interactions.
-run.review()
-# CONFIGURATION LOGIC: Compare any two saved models, not necessarily Base.
-comparison = run.compare("Quote", "Quote+CrossBond", stage="Validation")
-# REPORTING LOGIC: Recompute an exact paired table for an arbitrary existing metadata column.
-table = comparison.slice("rating", min_count=50)
-# REPORTING LOGIC: Cross slices are computed from individual paired records, not averaged group metrics.
-cross = comparison.cross_slice("SECTOR", Slice("QUANTITY", [0, 1e6, 5e6, float("inf")], right=False))
-# FILE IO LOGIC: Export new complete PNG/CSV/HTML evidence without printing large tables.
-comparison.export("reviews", interactions=[("SECTOR", Slice("MATURITY_YEARS", [0,1,3,10,float("inf")]))])
+run = load_run('runs/my_research')
+# UI LOGIC: Select saved models, population filters, single slices and two-column heatmaps.
+panel = run.review(stage='Validation')
+# CONFIGURATION LOGIC: Any pair of saved models can be selected; Base is not mandatory.
+comparison = run.compare('Quote', 'Quote+CrossBond', stage='Validation')
+# REPORTING LOGIC: Aggregate paired records on a retained user metadata column.
+table = comparison.slice('rating', min_count=50)
+# FILE IO LOGIC: Export complete PNG/CSV/HTML evidence without printing large result tables.
+comparison.export('reviews', interactions=[('SECTOR', Slice('QUANTITY', [0, 1e6, 5e6, float('inf')], right=False))])
 ```
 
-The UI supports custom numerical bins, category slices, two intersecting filters, two-column heatmaps with count panels, minimum support, gain/error metrics and saved exports. Add any new slice column to the original transaction DataFrame; it survives into saved predictions. `comparison.filter(...)` can create more complex intersections programmatically. Saved models from other projects can be wrapped in `Model` and compared through `compare_models`; saved prediction columns can use `compare_predictions`. These generic APIs do not train models.
+The comparison UI supports custom bins, two intersecting filters, interactions with count panels, support thresholds, gain/error metrics and exports. Additional source metadata stays available in saved predictions. `comparison.filter(...)` supports further programmatic intersections. Generic `compare_predictions` and `compare_models` also compare external saved results or loaded estimators without training them.
 
-## 5. Final evaluation
+## 7. Final test and resume
 
-After fixing the validation choice:
+After accepting the frozen validation choice, explicitly call `run.finalize_test()` or:
 
 ```bash
 python -m raw_quote_engine.cli final-test examples/runs/my_research
 ```
 
-This uses the same trained Base and selected candidate, without a refit or additional candidate search. It verifies the frozen selection and evaluates only those two models. Repeat calls reuse saved test predictions. Previously inspected or externally exposed test data is not magically locked again; disclose that history in interpreting the report.
+Only Base and the selected candidate are evaluated, using the same Train-fitted models. No final refit is performed. Repeat calls reuse saved predictions. Prior external exposure of those dates remains a limitation; the engine cannot restore unseen status.
 
-For an unattended run, use `run --config ... --final-test`. Its ordering still freezes the validation choice before generating test predictions. The engine never automatically changes cleaning rules after seeing test losses.
+Outputs include `report.html`, full tables/figures, `features.parquet`, validation predictions, model files and schemas, `selection.json` and a manifest of configuration, versions, fingerprints and evaluation state. Explicit finalization adds test predictions and test evidence. Source inputs and generated artifacts stay local.
 
-## Outputs and resume
-
-`report.html` links actual tables/plots and documents exclusions, missing metadata, date support and limitations. `features.parquet` preserves one row per requested transaction. `predictions_validation.parquet` contains every fixed validation model; `predictions_test.parquet` contains only Base and the frozen candidate. `models/` contains native LightGBM text models and their exact feature/category schemas. `selection.json` is the validation decision. `manifest.json` records config, fingerprints, versions and evaluation status.
-
-Repeat the same call to reuse completed stages. Changed inputs/settings require a new output directory and can reuse the shared content-addressed cache. Comments alone do not invalidate numerical cache signatures. To regenerate HTML only, run `python -m raw_quote_engine.cli report runs/my_research`. An interrupted incomplete run can be resumed with the original raw inputs/config; no kernel restart is needed to refresh a report.
-
-Data, model binaries, caches, predictions and run reports remain local and are ignored by Git. Only code, the empty-output starter notebook and documentation are shipped. Cache/model pickle files must come from your own trusted run directory. Sharing a report may expose issuer/dealer labels and representative transaction records; use the resulting local files according to your data access policy.
+An unchanged call resumes completed stages. Changed inputs or settings require a new output folder; a shared content-addressed cache may reuse unaffected stages. Comments alone do not invalidate numerical signatures. Regenerate HTML with `python -m raw_quote_engine.cli report runs/my_research`. Use only trusted local cache/model files. Reports retain supplied labels and representative records, so review them before sharing.

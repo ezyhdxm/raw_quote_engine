@@ -9,19 +9,20 @@
 | `bond` | Stable security identity; not issuer. CSV identifiers are read as strings to retain leading zeros. |
 | `time` | The time the prediction would have been made. Features only use quotes known by this boundary. |
 | `target` | Numeric regression label. Use a level by default; set `TrainingConfig(target_mode="delta")` for an anchor-relative label. |
-| `actual` | Optional explicit realized outcome for scoring. It takes precedence over the inferred target or target + anchor. Useful when the fitted delta contains an upstream adjustment. Missing actuals remain unscored; they are not filled from the target. |
+| `actual` | Optional explicit realized outcome for scoring. It takes precedence over the inferred target or target + anchor - rollover adjustment. Useful when the fitted delta contains an upstream adjustment. Missing actuals remain unscored; they are not filled from the target. |
 | `id` | Optional unique transaction identity. Without it, input row position supplies a stable ID for that input order. |
 | `quantity`, `prev_quantity` | Current/previous trade notional. `quantity_scale` converts both to the units used by large-trade thresholds; use actual currency notionals for 1MM slices. |
 | `issuer`, `sector` | Optional transaction-time metadata. No later issuer label is backfilled into earlier issuer features. |
 | `maturity_years` or `maturity_date` | Optional remaining maturity; a date is converted at prediction time. Map one representation. |
-| `anchor`, `cpp` | Optional values observable before the prediction. Their discrepancy supports pre-trade anchor-quality slices. |
+| `anchor`, `cpp` | Optional user-prepared values observable before prediction. Proxy discrepancy uses `abs(cpp - (anchor - adjustment))`; the engine never constructs a proxy. |
+| `rollover_adjustment` | Optional prediction-time scalar for a target defined as `actual - anchor + adjustment`; delta predictions reconstruct as `prediction + anchor - adjustment`. No mapping means zero adjustment; a mapped missing/nonfinite value rejects the run. |
 | `split` | Optional explicit Train/Validation/Test/Embargo labels; chronological order is validated. |
 
 Missing or invalid target values are retained for coverage diagnosis and excluded from fitting/scoring. Invalid transaction identities/times fail early rather than silently dropping prediction requests. Additional metadata such as rating, trading venue, trade direction or a user-defined liquidity category stays available for arbitrary slices.
 
-Base feature lists are explicit and ordered. Categorical vocabularies are fitted on Train only; unseen evaluation categories become missing. Numeric infinities become missing model inputs. The engine rejects direct inclusion of the mapped target and actual outcome, but cannot prove that arbitrary supplied base features are causal. Establish this upstream.
+Base feature lists are explicit and ordered; `base_cat_features` is their explicit categorical subset. Other baseline fields are numeric. Categorical vocabularies are fitted on Train only; unseen evaluation categories become missing. Numeric infinities become missing model inputs. The engine rejects direct inclusion of the mapped target and actual outcome, but cannot prove that arbitrary supplied base features are causal. Establish this upstream.
 
-`TrainingConfig(category_order="appearance")` preserves first-observed training category order; the generic default is `"sorted"`. `apply_model_defaults=False` passes only supplied model parameters to LightGBM, allowing an existing parameter dictionary to retain its library defaults. The generic default is `True`, which adds the engine's training defaults before applying supplied overrides. Both switches are saved in the run manifest.
+`TrainingConfig(category_order="appearance")` preserves first-observed training category order; the generic default is `"sorted"`. `apply_model_defaults=False` passes only supplied model parameters to LightGBM, allowing an existing parameter dictionary to retain its library defaults. The generic default is also `False`; `True` explicitly adds engine training defaults before applying supplied overrides. Both switches are saved in the run manifest.
 
 ## Raw quotes
 
@@ -46,13 +47,13 @@ Unknown, zero and malformed size are distinct diagnoses. Positive raw size equal
 
 ## Time and units
 
-Naive timestamps are interpreted in the configured timezone. Aware timestamps are converted to it. Ambiguous/nonexistent naive DST timestamps raise, and mixed naive/aware input must be resolved upstream. State does not carry overnight. `allow_exact=True` includes a quote with known time equal to prediction time; use `False` when sequencing is uncertain. Duplicate transaction timestamps remain separate records.
+Naive transaction timestamps use `timezone`. Naive quote timestamps use `quote_timezone` when set, otherwise `timezone`. Aware timestamps are converted to the state timezone without changing their instants. Ambiguous/nonexistent naive DST timestamps raise, and mixed naive/aware input must be resolved upstream. State does not carry overnight. `allow_exact=True` includes a quote with known time equal to prediction time; use `False` when sequencing is uncertain. Duplicate transaction timestamps remain separate records.
 
-`target_scale` multiplies target, actual, anchor and CPP. `quote_scale` multiplies quote values. These must produce compatible units before quote-minus-anchor features are formed. `error_scale` converts prediction errors to the displayed `unit` only; it does not rescale features or repair a quote/target mismatch. Example: decimal spreads → bps uses `target_scale=10000, quote_scale=10000, error_scale=1, unit="bps"`.
+`target_scale` multiplies target, actual, anchor, the optional proxy (`cpp`) and the optional rollover adjustment. `quote_scale` multiplies quote values. These must produce compatible units before quote-minus-anchor features are formed. `error_scale` converts prediction errors to the displayed `unit` only; it does not rescale features or repair a quote/target mismatch. Example: decimal spreads → bps uses `target_scale=10000, quote_scale=10000, error_scale=1, unit="bps"`.
 
-For spreads, signed width is bid minus ask; for prices, it is ask minus bid. Negative width denotes crossing in both modes. An increase in price is not called spread widening. Price-to-spread/yield conversions, currencies, benchmark definitions and accrued-interest conventions are outside this engine.
+Only spread-valued input is supported: `value_kind` must be `"spread"`, and price input is rejected. Signed width is bid minus ask; negative width denotes crossing. Price-to-spread/yield conversions, currencies, benchmark definitions and accrued-interest conventions belong upstream. The optional rollover scalar reconstructs the transaction baseline; it does not align historical quote benchmarks across time.
 
-The internal `spread`, `bcq_`, `_bps` and `_30m` names are retained from audited numerical kernels to make their lineage inspectable. `_bps` values use configured quote units; path `_30m` windows follow `lookback_min`. Defaults: 30-minute lookback/freshness, 1-minute synchronization, 60-minute history break. `clip_floor` is in normalized quote-value units, not automatically bps. Optional peer-rule diagnostics need a floor appropriate for price mode; they are not in the fixed default model families.
+The internal `spread`, `bcq_`, `_bps` and `_30m` names are retained from audited numerical kernels to make their lineage inspectable. `_bps` values use configured quote units; path `_30m` windows follow `lookback_min`. Defaults: 30-minute lookback/freshness, 1-minute synchronization, 60-minute history break. `clip_floor` is in normalized quote-value units, not automatically bps. Set this floor in the normalized spread units; peer-rule diagnostics are not in the fixed default model families.
 
 ## Scope
 
@@ -64,4 +65,8 @@ Historical trade counts use supplied transactions in `[t-30 days,t)`. Equal-time
 
 Set `PipelineConfig(priority_history_column="your_prior_count")` to use an existing upstream history count for priority cohorts. This explicit source overrides the trailing count even when missing, in which case affected cohorts are reported unsupported. With `None`, the generic trailing-count preference is unchanged. The configured field's historical window and feed completeness remain the caller's responsibility.
 
-Set `PipelineConfig(priority_cpp_gap_column="your_gap_bps")` to supply the precomputed CPP–anchor discrepancy in **bps** for the strict `>5` and `>10` priority cohorts. The engine uses its absolute value without applying `target_scale` or `error_scale` again. Missing values stay unknown; a missing configured column makes the CPP cohorts unsupported, even when `cpp` and `anchor` exist. This avoids changing exact threshold boundaries by reconstructing and then subtracting the anchor. A spread/bps contract is required. The default `None` retains `abs(cpp-anchor) * error_scale`.
+Set `PipelineConfig(priority_cpp_gap_column="your_gap_bps")` to supply the precomputed CPP–anchor discrepancy in **bps** for the strict `>5` and `>10` priority cohorts. The engine uses its absolute value without applying `target_scale` or `error_scale` again. Missing values stay unknown; a missing configured column makes the CPP cohorts unsupported, even when `cpp` and `anchor` exist. This avoids changing exact threshold boundaries by reconstructing and then subtracting the anchor. A spread/bps contract is required. The default `None` uses `abs(cpp - (anchor - adjustment)) * error_scale`, with zero adjustment only when no adjustment column is mapped. A mapped missing/nonfinite rollover value rejects the run; missing proxy values remain unknown.
+
+## Ownership and interactive configuration
+
+`research_form` takes two prepared DataFrames, `BASE_FEATURES`, `BASE_CAT_FEATURES` and `LGB_PARAMS`. Configuration objects can prefill source mappings and research settings; the form remains editable. Validate performs structural preflight, and Run validation starts computation. Displaying the form does not train. Dataset-specific transformations, sector maps, proxy construction, baseline engineering and benchmark repairs stay in the user notebook or upstream pipeline; no dataset preset is installed.

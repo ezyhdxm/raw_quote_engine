@@ -37,7 +37,7 @@ def assemble_features(tx, quotes, events, config, progress=None):
                                    progress, events, config.value_kind, config.clip_floor)
     movement, movement_meta = build_movement_features(
         tx, events, lookback_min=config.lookback_min, age_min=config.age_min,
-        allow_exact=config.allow_exact, include_issuer='ISSUER' in tx, progress=progress,
+        allow_exact=config.allow_exact, include_issuer=config.transactions.issuer is not None, progress=progress,
         query_positions=np.arange(len(tx)))
     path, path_meta = build_path_features(events, tx, np.arange(len(tx)), progress,
                                          config.age_min, config.lookback_min, config.allow_exact)
@@ -53,15 +53,17 @@ def assemble_features(tx, quotes, events, config, progress=None):
     history = history_features(frame)
     frame = pd.concat([frame, history], axis=1)
     # CORE LOGIC: STEP 2 — Express quote levels relative to a supplied prediction-time anchor.
-    # Input: bid center=105, ask center=103, anchor=100.
-    # Output: bcq_bid_center_equal_to_anchor=5, bcq_ask_center_equal_to_anchor=3.
-    # Explanation: Center differences share units with the scaled anchor; unknown values remain NaN.
-    # Trick: Anchor must already be observable at prediction time; the current target is never subtracted.
-    if 'anchor' in frame:
+    # Input: bid center=105, ask center=103, anchor=100, mapped rollover_adjustment=2.
+    # Output: bcq_bid_center_equal_to_anchor=7, bcq_ask_center_equal_to_anchor=5.
+    # Explanation: The benchmark-adjusted anchor is 100-2=98; without a mapping the differences would be 5 and 3.
+    # Trick: Anchor and adjustment must be observable at prediction time; target is never read and an unmapped source column is ignored.
+    if config.transactions.anchor is not None:
+        adjustment = frame.rollover_adjustment if config.transactions.rollover_adjustment is not None else 0.
+        effective_anchor = frame.anchor-adjustment
         levels = [c for c in current if 'center_' in c and not c.endswith('n_changed_centers')]
         levels += [c for c in ('bcq_pair_mid', 'bcq_size_time_mid') if c in current]
         for name in levels:
-            frame[name+'_to_anchor'] = frame[name]-frame.anchor
+            frame[name+'_to_anchor'] = frame[name]-effective_anchor
     # METADATA LOGIC: Return the exact columns used to construct each nested ablation.
     groups = feature_groups(frame)
     metadata = {'movement': movement_meta, 'path': path_meta, 'groups': groups}
@@ -120,7 +122,7 @@ def feature_dictionary(frame, groups, config):
         'n_clipped_dealers': ('count', 'Peer-supported dealers with any candidate outside their peer clipping interval; counts candidate changes even when the median stays unchanged.'),
         'n_changed_centers': ('count', 'Peer-supported dealers whose candidate-clipped median differs from the original c_i with rtol=0 and atol=1e-9.'),
     }
-    # CONFIGURATION LOGIC: Width is bid-minus-ask for spread input, ask-minus-bid for price input.
+    # CONFIGURATION LOGIC: Width is bid-minus-ask for the supported spread input.
     pair_specs = {
         'has_quote': ('indicator', '1 when either side has at least one latest complete same-day dealer state, otherwise 0; freshness is not required.'),
         'n_pair': ('count', 'Dealers with both latest sides complete on the same day and max(bid_age,ask_age) <= age_min.'),
@@ -180,10 +182,10 @@ def feature_dictionary(frame, groups, config):
         details[f'bcq_path_{side}_comparable_n'] = dict(unit='count', definition='Number of currently fresh complete dealer states with a comparable preceding state; denominator for all three path fractions.', family='Quote path', support=path_support)
     # CONFIGURATION LOGIC: Distinguish model-error units from the normalized quote-value features themselves.
     value_unit = 'normalized '+config.value_kind+' units'
-    conventions = (f'Quote values use quote_scale={config.quote_scale:g}; target/anchor/cpp use target_scale={config.target_scale:g} into compatible value units. '
+    conventions = (f'Quote spreads use quote_scale={config.quote_scale:g}; target/anchor/proxy/rollover_adjustment use target_scale={config.target_scale:g} into compatible units. '
                    f'Prediction errors alone multiply by error_scale={config.error_scale:g} to produce {config.unit}. '
                    f'Local timezone={config.timezone}; allow_exact={config.allow_exact}; age_min={config.age_min:g}; sync_min={config.sync_min:g}; lookback_min={config.lookback_min:g}. '
-                   'Legacy _bps/_30m names do not override these units or windows; positive quote movement means value increase, including price input.')
+                   'Legacy _bps/_30m names do not override these units or windows; positive quote movement means spread widening.')
     # CORE LOGIC: STEP 4 — Require a formal definition for every actually generated quote column.
     # Input: frame columns=['row_id','bcq_has_quote','bcq_bid_center_equal_to_anchor']; details contains both base names.
     # Output: dictionary visits bcq_has_quote and bcq_bid_center_equal_to_anchor, using bcq_bid_center_equal as the latter's formula.
@@ -197,12 +199,13 @@ def feature_dictionary(frame, groups, config):
         specification = dict(details[base])
         # CORE LOGIC: STEP 5 — Add anchor subtraction, missing-value behavior, and exact ablation membership.
         # Input: name='bcq_bid_center_equal_to_anchor', groups={'Quote':['bcq_bid_center_equal_to_anchor']}, value_kind='spread'.
-        # Output: models='Quote', unit='normalized spread units', definition ends 'Subtract the supplied prediction-time anchor from that result.'.
+        # Output: models='Quote', unit='normalized spread units'; with no rollover mapping, definition adds 'Subtract the supplied prediction-time anchor from that result.'.
         # Explanation: A feature may be diagnostic-only (empty models); unsupported numeric outputs remain NaN, while known counts/indicators are zero.
         # Trick: Membership uses complete column names from actual model groups, not inference from feature prefixes.
         if name.endswith('_to_anchor'):
-            specification['definition'] += ' Subtract the supplied prediction-time anchor from that result.'
-            specification['support'] += ' Anchor must be observable at query time; missing anchor yields NaN.'
+            formula = 'anchor minus rollover_adjustment' if config.transactions.rollover_adjustment is not None else 'anchor'
+            specification['definition'] += f' Subtract the supplied prediction-time {formula} from that result.'
+            specification['support'] += ' Anchor and any mapped rollover adjustment must be observable at query time; missing anchor yields NaN.'
         original_unit = specification['unit']
         specification['unit'] = value_unit if original_unit == 'quote value unit' else original_unit
         specification['missingness'] = 'Zero when no qualifying support exists.' if original_unit in {'count', 'indicator'} else 'NaN when the defined support is unavailable; a measured zero remains zero.'

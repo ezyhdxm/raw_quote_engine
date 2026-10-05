@@ -1,70 +1,59 @@
 # Raw Quote Engine
 
-Turn raw dealer quotes and transaction-level training data into a reproducible research report. The engine runs a fixed sequence: population diagnosis → exact-event history → causal quote features → quality and case diagnostics → chronological LightGBM experiments and model comparisons.
+Compare raw dealer **spread quotes** with a user-supplied transaction baseline. The engine runs population diagnosis, exact-event history, causal quote features, quality/case diagnostics, and chronological LightGBM comparisons. All report tables and figures are calculated from the current inputs.
 
-It is adapted from a BondCliQ research project, but requires no BondCliQ files, existing caches, saved models, or old notebook outputs. Quotes can be **wide bid/ask** or **long side/value**, in **spread or price units**. The supplied transaction bonds define the universe. The input period is not hardcoded.
+It accepts prepared transaction and quote DataFrames, an ordered baseline feature list, an explicit categorical-feature list and LightGBM parameters. Source mappings and research settings are editable in a notebook form. Quotes may be wide bid/ask or long side/value. Price input is rejected; any price-to-spread conversion belongs upstream.
 
-## Start here
-
-**Using the existing BondCliQ files and `data_ig`?** Open [bondcliq_research.ipynb](bondcliq_research.ipynb), change its two input paths, and follow the [BondCliQ example](docs/BONDCLIQ_EXAMPLE.md). Its preset supplies the original BASE14 list, LightGBM parameters, source mappings and pilot dates; the guide distinguishes the engine's new quote experiments from the historical notebook.
+## Start in a notebook
 
 ```bash
 python -m pip install -e ".[notebook]"
-python -m raw_quote_engine.cli demo --output runs/synthetic_demo
+python -m jupyter lab raw_quote_research.ipynb
 ```
 
-Open `runs/synthetic_demo/report.html`. This smoke run is explicitly synthetic and demonstrates the complete workflow; its gains are not evidence about any real quote feed.
+[raw_quote_research.ipynb](raw_quote_research.ipynb) starts with clearly labelled synthetic inputs. Replace them with your prepared DataFrames, inspect the form, click **Validate inputs**, then **Run validation**. Running all cells alone does not train or open final test.
 
-For real data, copy [examples/config.json](examples/config.json), edit the file paths and column names, then run:
-
-```bash
-python -m raw_quote_engine.cli run --config examples/config.json
-```
-
-The default produces a **validation report** and reserves test. After reviewing the fixed candidate choice:
-
-```bash
-python -m raw_quote_engine.cli final-test examples/runs/my_research
-```
-
-Alternatively, add `--final-test` to the initial run command to execute that same sequence automatically: freeze the validation winner first, then evaluate only it and Base on test.
+For the existing BondCliQ files, use [bondcliq_research.ipynb](bondcliq_research.ipynb) and [its guide](docs/BONDCLIQ_EXAMPLE.md). Its source preparation and configuration are visible in notebook cells. The baseline now uses separate counterparty and side categories, giving 15 inputs; it does not replay historical BASE14 scores. There is no dataset-specific engine preset.
 
 ## DataFrame interface
 
 ```python
-# CONFIGURATION LOGIC: Map the actual source columns; naive timestamps use the declared local timezone.
-from raw_quote_engine import TransactionColumns, QuoteColumns, PipelineConfig, run_research
+# SETUP LOGIC: Import the generic form; inputs and upstream feature definitions remain user-owned.
+from raw_quote_engine import research_form
 
-config = PipelineConfig(
-    transactions=TransactionColumns(
-        bond="CUSIP", time="prediction_time", target="BM_SPREAD",
-        quantity="QUANTITY", issuer="ISSUER", sector="SECTOR",
-        maturity_years="YRS_TO_MATURITY", anchor="PREV_BM_SPREAD", cpp="CPP_SPREAD",
-    ),
-    quotes=QuoteColumns(
-        bond="cusip", known_time="known_time", dealer="dealer_id",
-        bid="bid", ask="ask", quantity="size",
-    ),
-    value_kind="spread", unit="bps", timezone="America/New_York",
+# UI LOGIC: Supply the five inputs, map source columns in the form, then validate and start explicitly.
+controller = research_form(
+    transactions_df, quotes_df, BASE_FEATURES, BASE_CAT_FEATURES, LGB_PARAMS,
+    output='runs/my_research',
 )
-# ORCHESTRATION LOGIC: All five stages use the supplied data and save their actual calculated results.
-run = run_research(data_ig, raw_quotes, base_features, lgbm_params, config, output="runs/my_research")
-# UI LOGIC: Compare saved models, choose slices and export figures without another fit.
-run.review()
 ```
 
-The column names above are examples, not required source names. Omit an optional mapping when that metadata is unavailable. Bond ID, prediction/known time, quote dealer, quote values, target, and at least one base feature are essential. **Price and spread are not interchangeable**: supply compatible numerical units or perform a justified conversion upstream.
+An optional `config=PipelineConfig(...)` and `training=TrainingConfig(...)` prefill the form. The engine does not infer sector mappings, synthesize a proxy, engineer the supplied baseline, repair source multipliers or guess benchmark conventions. After validation completes, `controller.run` is the result; `controller.run.review()` opens comparisons of saved predictions without refitting.
 
-## What you receive
+For scripts, use the same explicit inputs and mappings:
 
-- A self-contained English report with calculated tables and complete PNG figures.
-- Full-precision CSV diagnostics and a feature dictionary.
-- Causal per-transaction features and saved prediction Parquet files.
-- Four fixed experiments: Base, Quote, Quote+Path, Quote+CrossBond. The latter adds matched-dealer and other-bond issuer changes; it is not a fitted latent-factor model.
-- MAE, RMSE, P95, bias, paired win rate, coverage, date stability, default one-/two-column slices, and arbitrary model-pair comparisons.
-- Priority slices for large trades, maturity, historical activity and anchor-versus-CPP discrepancies when the required metadata exists.
-- Native LightGBM models, training category schemas, frozen selection, input fingerprints, package versions and resumable local stage caches.
+```python
+# SETUP LOGIC: Use the programmatic pipeline only when starting a run is intended.
+from raw_quote_engine import run_research
+# ORCHESTRATION LOGIC: This call starts Steps 1–5 through validation and saves their computed evidence.
+run = run_research(
+    transactions_df, quotes_df, BASE_FEATURES, LGB_PARAMS, config,
+    base_cat_features=BASE_CAT_FEATURES, training=training, output='runs/my_research',
+)
+```
 
-State calculations retain zero/negative spreads, unknown sizes, multi-price events and crossings. They never silently drop transactions without quote coverage. Raw candidate clipping/downweighting is a diagnosed feature alternative, not a destructive cleaning operation.
+A CLI configuration is shown in [examples/config.json](examples/config.json). Its paths and columns are illustrative. For a synthetic smoke report: `python -m raw_quote_engine.cli demo --output runs/synthetic_demo`.
 
-Read [the usage guide](docs/USAGE.md), [the data contract](docs/DATA_CONTRACT.md), and [the BondCliQ lessons](docs/BONDCLIQ_LESSONS.md). Open [raw_quote_research.ipynb](raw_quote_research.ipynb) for a notebook entry point. No QR transfer or camera workflow is needed.
+## What the run produces
+
+- An English report, complete PNG figures, exact CSV diagnostics and a feature dictionary.
+- Causal per-transaction features, saved predictions and native LightGBM models.
+- Four fixed families: Base, Quote, Quote+Path and Quote+CrossBond; no fitted latent-factor model is implied.
+- Common-record MAE, RMSE, P95, bias, win rate, coverage and descriptive date stability.
+- Any pair of saved models, arbitrary metadata slices, two-column heatmaps and custom exports.
+- Optional quantity, maturity, history and prior-anchor/proxy slices when their input contracts are supplied.
+- Frozen validation selection, input fingerprints, category schemas and resumable stage caches.
+
+No-quote transactions, zero/negative spreads, unknown sizes, simultaneous candidates and crossings remain visible. Candidate clipping and dealer downweighting are diagnostics, not destructive source cleaning. Final test requires an explicit action after validation and reuses the Train-fitted Base and selected candidate.
+
+Read [USAGE.md](docs/USAGE.md), [DATA_CONTRACT.md](docs/DATA_CONTRACT.md) and [BONDCLIQ_LESSONS.md](docs/BONDCLIQ_LESSONS.md). Source-specific preprocessing stays in the user's notebook; data, caches, models and generated reports stay local.

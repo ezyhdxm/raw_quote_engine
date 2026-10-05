@@ -13,8 +13,8 @@ SUPPORT_COLUMNS = [f'bcq_path_{side}_comparable_n' for side in ('bid', 'ask')]
 PATH_DEFINITIONS = {
     'last_move_signed_median': {'unit': 'quote value unit', 'definition': 'Median last nonzero guarded quote-value move across currently comparable dealers; move may predate the configured lookback window.'},
     'flat_refresh_share': {'unit': 'fraction', 'definition': 'Share of currently comparable dealers whose latest quote/quantity pairs equal their preceding message.'},
-    'widened_30m_share': {'unit': 'fraction', 'definition': 'Share of comparable dealers whose last nonzero quote-value move is positive within the configured left-open lookback window; the legacy name applies to prices too.'},
-    'narrowed_30m_share': {'unit': 'fraction', 'definition': 'Share of comparable dealers whose last nonzero quote-value move is negative within the configured left-open lookback window; the legacy name applies to prices too.'}}
+    'widened_30m_share': {'unit': 'fraction', 'definition': 'Share of comparable dealers whose last nonzero spread move is positive within the configured left-open lookback window.'},
+    'narrowed_30m_share': {'unit': 'fraction', 'definition': 'Share of comparable dealers whose last nonzero spread move is negative within the configured left-open lookback window.'}}
 _MINUTE = 60 * 10**9
 _NAT = np.iinfo(np.int64).min
 

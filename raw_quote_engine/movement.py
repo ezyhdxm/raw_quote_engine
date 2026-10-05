@@ -2,7 +2,7 @@
 """Causal matched-dealer and leave-one-bond-out issuer changes from known-time events.
 
 The pipeline explicitly requests all rows, without reading targets. Internal _bps
-suffixes are in configured quote units, including points for price input.
+suffixes are in configured spread units; input benchmark consistency is established upstream.
 """
 # SETUP LOGIC: Read no data and fit no models on import.
 from time import perf_counter
@@ -259,7 +259,7 @@ def _movement_at(states, times, day_ns, lookback_ns, age_ns, allow_exact):
     # Input: delta=[4,-2,0],current_n=4,lookback_n=3; guarded has two valid values.
     # Output: up/down/flat each=1/3; common_n=3,current_n=4,lookback_n=3,guarded_common_n=2.
     # Explanation: [4,-2,0] has one increase, decrease and unchanged value, each divided by three common dealers. The current roster of four describes coverage, not the direction-fraction denominator.
-    # Trick: Positive/negative means increase/decrease in the declared quote value, including price input; exactly zero is flat and unsupported fractions remain NaN.
+    # Trick: Positive/negative means spread widening/narrowing; exactly zero is flat and unsupported fractions remain NaN.
     for name, values in [("up_fraction", delta > 0), ("down_fraction", delta < 0), ("flat_fraction", delta == 0)]:
         result[:, _MOVE_COL[name]] = np.divide(values.sum(axis=1), common_n,
             out=np.full(n, np.nan), where=common_n > 0)

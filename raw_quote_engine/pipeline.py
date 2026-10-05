@@ -10,13 +10,14 @@ import os
 import numpy as np
 import pandas as pd
 from bond_pricer import compare_predictions, show_comparison, Slice
+from bond_pricer.slices import default_slices
 from .config import PipelineConfig
 from .ingest import normalize_transactions, normalize_quotes
 from .state import prepare_quote_events
 from .features import assemble_features, feature_dictionary
 from .training import TrainingConfig, assign_splits, variants, fit_models, predict_stage, comparisons_for, select_candidate
 from .cache import Progress, StageCache, code_signature, fingerprint, digest, write_json
-from .diagnostics import diagnostic_tables
+from .diagnostics import diagnostic_tables, diagnostic_view
 from .report import write_report
 
 
@@ -51,7 +52,8 @@ class ResearchRun:
         config = PipelineConfig.from_dict(self.metadata['config'])
         return show_comparison(frame, actual='actual_level', predictions=options,
             id_column='row_id', time_column='time', bond_column='cusip',
-            error_scale=config.error_scale, unit=config.unit, timezone=config.timezone)
+            error_scale=config.error_scale, unit=config.unit, timezone=config.timezone,
+            default_slices=default_slices(diagnostic_view(frame, config.to_dict(), preserve_priority_sources=False).columns))
 
     def finalize_test(self):
         # EVALUATION LOGIC: This explicit call reuses the frozen validation choice and trained estimators.
@@ -59,11 +61,13 @@ class ResearchRun:
 
 
 def run_research(transactions, quotes, base_features, model_params, config, *, output='runs/research',
-                 training=None, evaluate_test=False, cache_dir=None, progress=None, quote_universe=None):
+                 base_cat_features=None, training=None, evaluate_test=False, cache_dir=None, progress=None, quote_universe=None):
     """Run Steps 1–5. Existing completed stages resume only when data and settings match."""
-    # CONFIGURATION LOGIC: Keep the four essential inputs explicit, accepting dataclass or JSON-style mappings.
+    # CONFIGURATION LOGIC: Keep source mappings, feature definitions and model settings explicit.
     config = config if isinstance(config, PipelineConfig) else PipelineConfig.from_dict(config)
     training = training if isinstance(training, TrainingConfig) else TrainingConfig(**(training or {}))
+    if config.transactions.rollover_adjustment is not None and training.target_mode != 'delta':
+        raise ValueError('A rollover_adjustment mapping requires target_mode="delta"; supply target=actual-anchor+adjustment.')
     notify = Progress(progress)
     output = Path(output).expanduser().resolve()
     # FILE IO LOGIC: An unrelated existing folder is never treated as an engine-owned result directory.
@@ -74,25 +78,28 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
     # INGESTION LOGIC: Source files are read once; users retain their original DataFrames unchanged.
     notify('step1', None, None, 'Normalizing supplied transactions and known-time raw quotes')
     tx, tx_audit = normalize_transactions(transactions, config)
+    validate_features(tx, base_features, config, training, base_cat_features)
     raw, quote_audit = normalize_quotes(quotes, config, tx if quote_universe is None else quote_universe)
-    validate_features(tx, base_features, config, training)
-    tx = assign_splits(tx, training)
+    tx = assign_splits(tx, training, use_supplied_split=config.transactions.split is not None)
     # CACHEING LOGIC: Numerical code, full-precision input contents and explicit settings identify this run.
     numerical = code_signature(['ingest.py', 'state.py', 'movement.py', 'path.py', 'features.py'])
     event_key = digest(fingerprint(raw), code_signature(['state.py']), version('pandas'), version('numpy'))
     feature_key = digest(fingerprint(tx), event_key, config.to_dict(), numerical)
     library_versions = {name: version(name) for name in ('pandas', 'numpy', 'lightgbm')}
-    model_key = digest(feature_key, base_features, model_params, training.to_dict(), code_signature(['training.py']), library_versions)
+    model_key = digest(feature_key, base_features, base_cat_features, model_params, training.to_dict(), code_signature(['training.py']), library_versions)
     receipt = output/'manifest.json'
     if receipt.exists() and json.loads(receipt.read_text()).get('run_key') != model_key:
         raise ValueError('This output directory belongs to different inputs/settings. Choose a new output directory; shared caches remain reusable.')
     # CACHEING LOGIC: Completed runs keep their original frozen decision and any already exposed test.
     if receipt.exists() and json.loads(receipt.read_text()).get('status') != 'running':
         run = load_run(output)
+        # PROVENANCE LOGIC: Excluded rows can change audit counts without changing numerical cache inputs.
+        run.metadata['normalization'] = {'transactions': tx_audit, 'quotes': quote_audit}
+        write_json(receipt, run.metadata)
         render(run, config)
         notify('report', 1, 1, 'Reusing complete run: '+str(run.report))
         return finalize_test(output, progress=progress) if evaluate_test else run
-    metadata = manifest(config, training, model_key, feature_key, model_params, base_features, tx_audit, quote_audit)
+    metadata = manifest(config, training, model_key, feature_key, model_params, base_features, tx_audit, quote_audit, base_cat_features)
     write_json(receipt, metadata)
     # ORCHESTRATION LOGIC: One event aggregation feeds state, movement, path and diagnostic calculations.
     events = cache.get('step2_events', event_key, lambda: prepare_quote_events(raw, notify))
@@ -103,9 +110,10 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
     tables['splits'] = split_table(frame)
     definitions = variants(base_features, feature_meta['groups'])
     # MODELING LOGIC: Training cache reuse avoids repeated fitting when a user only needs another slice/report.
-    models = cache.get('step5_models', model_key, lambda: fit_models(frame, definitions, model_params, training, notify))
+    models = cache.get('step5_models', model_key, lambda: fit_models(frame, definitions, model_params, training, notify, base_cat_features))
     actual_column = 'actual' if config.transactions.actual is not None else None
-    validation = cache.get('step5_validation', model_key, lambda: predict_stage(frame, models, 'Validation', training, actual_column))
+    adjustment_column = 'rollover_adjustment' if config.transactions.rollover_adjustment is not None else None
+    validation = cache.get('step5_validation', model_key, lambda: predict_stage(frame, models, 'Validation', training, actual_column, adjustment_column))
     selected = select_candidate(validation, config, training)
     # FILE IO LOGIC: Commit the validation decision before any test predictions or test loss calculations.
     metadata.update(selection=selected, feature_groups=feature_meta['groups'], status='validation_complete',
@@ -126,7 +134,7 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
     return finalize_test(output, progress=progress) if evaluate_test else run
 
 
-def validate_features(tx, base_features, config, training):
+def validate_features(tx, base_features, config, training, base_cat_features=None):
     # VALIDATION LOGIC: Guard direct leakage/collisions without claiming to audit user-supplied feature provenance.
     if tx.empty:
         raise ValueError('At least one valid transaction is required.')
@@ -134,18 +142,28 @@ def validate_features(tx, base_features, config, training):
         raise ValueError('Provide a nonempty, unique list of existing base feature columns.')
     if set(base_features) & {config.transactions.target, config.transactions.actual, 'target', 'actual'}:
         raise ValueError('Target and actual outcome columns cannot be base features.')
+    if base_cat_features is not None and (len(set(base_cat_features)) != len(base_cat_features) or set(base_cat_features)-set(base_features)):
+        raise ValueError('base_cat_features must be a unique subset of base_features; [] explicitly means all numeric.')
     reserved = [c for c in tx if c.startswith(('bcq_', 'prediction_', '__')) or c in {'actual_level', 'prior_trade_count_30d', 'history_days_available', 'history_30d_complete'}]
     if reserved:
         raise ValueError(f'Rename source columns reserved for generated research outputs: {reserved}')
-    if training.target_mode == 'delta' and ('anchor' not in tx or tx.anchor.isna().any()):
+    if training.target_mode == 'delta' and (config.transactions.anchor is None or 'anchor' not in tx or tx.anchor.isna().any()):
         raise ValueError('Delta targets require a finite prediction-time anchor for every transaction.')
 
 
-def manifest(config, training, key, feature_key, params, base, tx_audit, quote_audit):
+def manifest(config, training, key, feature_key, params, base, tx_audit, quote_audit, base_cat_features=None):
     # PROVENANCE LOGIC: Record the input audit and exact libraries, not a claim of generalization.
     versions = {name: version(name) for name in ('pandas', 'numpy', 'lightgbm', 'matplotlib')}
-    return dict(engine_version='0.1.1', run_key=key, feature_key=feature_key, synthetic=config.synthetic,
+    restoration = 'predicted_delta + anchor - rollover_adjustment' if config.transactions.rollover_adjustment is not None else 'predicted_delta + anchor'
+    reconstruction = dict(target_transform=f'supplied target * {config.target_scale:g}; no target recomputation',
+                          target_convention='actual spread' if training.target_mode == 'level' else restoration.replace('predicted_delta + ', 'actual - ').replace(' - rollover_adjustment', ' + rollover_adjustment'),
+                          prediction='predicted_level' if training.target_mode == 'level' else restoration,
+                          actual='mapped actual column' if config.transactions.actual is not None else ('target' if training.target_mode == 'level' else restoration.replace('predicted_delta', 'target')),
+                          omitted_rollover_adjustment=0, adjustment_available_at_prediction_time='caller responsibility')
+    return dict(engine_version='0.2.0', run_key=key, feature_key=feature_key, synthetic=config.synthetic,
                 config=config.to_dict(), training=training.to_dict(), base_features=list(base), model_params=params,
+                base_cat_features=None if base_cat_features is None else list(base_cat_features),
+                reconstruction=reconstruction,
                 dependencies=versions, normalization={'transactions': tx_audit, 'quotes': quote_audit},
                 test_status='not evaluated', test_exposure_history='unknown; caller must disclose prior use',
                 status='running', limitations=['Base feature causality must be established by the caller.',
@@ -252,7 +270,8 @@ def finalize_test(output, progress=None):
     models = {name: saved['models'][name] for name in ('Base', frozen['selected'])}
     notify('test', None, None, f'Evaluating frozen {frozen["selected"]} versus Base')
     actual_column = 'actual' if config.transactions.actual is not None else None
-    predictions = predict_stage(run.features, models, 'Test', settings, actual_column)
+    adjustment_column = 'rollover_adjustment' if config.transactions.rollover_adjustment is not None else None
+    predictions = predict_stage(run.features, models, 'Test', settings, actual_column, adjustment_column)
     # FILE IO LOGIC: Save one fixed test comparison and clearly mark that test is now exposed.
     temporary = run.output/'predictions_test.parquet.tmp'
     predictions.to_parquet(temporary, index=False)

@@ -12,7 +12,10 @@ class TrainingConfig:
     # CONFIGURATION LOGIC: Fractions count observed local dates; embargo dates are discarded between stages.
     validation_fraction: float = .2
     test_fraction: float = .2
+    validation_dates: int = None
+    test_dates: int = None
     embargo_dates: int = 1
+    test_embargo_dates: int = None
     min_train_dates: int = 3
     target_mode: str = 'level'
     selection_slice: str = 'large_long'
@@ -20,7 +23,7 @@ class TrainingConfig:
     useful_improvement_pct: float = 5.0
     seed: int = 2026
     category_order: str = 'sorted'
-    apply_model_defaults: bool = True
+    apply_model_defaults: bool = False
 
     def __post_init__(self):
         # VALIDATION LOGIC: Fail before expensive feature calculation on impossible experiment settings.
@@ -28,11 +31,16 @@ class TrainingConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f'{name} must be a nonnegative integer.')
+        for name in ('validation_dates', 'test_dates', 'test_embargo_dates'):
+            value = getattr(self, name)
+            minimum = 0 if name == 'test_embargo_dates' else 1
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum):
+                raise ValueError(f'{name} must be an integer >= {minimum}, or None.')
         if not np.isfinite(self.useful_improvement_pct) or self.useful_improvement_pct < 0:
             raise ValueError('useful_improvement_pct must be finite and nonnegative.')
         if not 0 < self.validation_fraction < 1 or not 0 <= self.test_fraction < 1:
             raise ValueError('Validation fraction must be in (0,1); test fraction in [0,1).')
-        if self.validation_fraction+self.test_fraction >= 1:
+        if self.validation_dates is None and self.test_dates is None and self.validation_fraction+self.test_fraction >= 1:
             raise ValueError('Leave a positive training fraction.')
         if self.embargo_dates < 0 or self.min_train_dates < 1 or self.min_selection_rows < 1:
             raise ValueError('Use nonnegative embargo dates and positive support thresholds.')
@@ -50,14 +58,17 @@ class TrainingConfig:
         return asdict(self)
 
 
-def assign_splits(tx, settings):
-    # CORE LOGIC: STEP 1 — Use caller-supplied stage labels without silently reshuffling rows.
-    # Input: supplied split=['Train','Validation','Test'] on three successively later timestamps.
-    # Output: those three labels and row identities are unchanged.
-    # Explanation: Explicit splits override date fractions; chronology is checked below.
-    # Trick: A user-supplied split is not evidence that test was never inspected; the report discloses this.
+def assign_splits(tx, settings, *, use_supplied_split=True):
+    # VALIDATION LOGIC: Engine callers enable source labels only through an explicit split-column mapping.
+    if not isinstance(use_supplied_split, bool):
+        raise ValueError('use_supplied_split must be a boolean.')
+    # CORE LOGIC: STEP 1 — Use declared labels, or allocate dates despite an unrelated source column named split.
+    # Input: 10 ordered dates; split=['Train']*8+['Validation']*2; fractions=.2/.2; embargo=0; use_supplied_split=False.
+    # Output: split=['Train']*6+['Validation']*2+['Test']*2; the caller's original split column is unchanged.
+    # Explanation: Explicitly disabled source labels cannot override the requested date policy.
+    # Trick: With use_supplied_split=True and a split column, labels are retained; copied frames isolate mutations.
     frame = tx.copy()
-    if 'split' not in frame:
+    if not use_supplied_split or 'split' not in frame:
         frame = automatic_splits(frame, settings)
     # VALIDATION LOGIC: Disallow interleaved stages and equal-time leakage across stage boundaries.
     allowed = {'Train', 'Validation', 'Test', 'Embargo'}
@@ -75,25 +86,26 @@ def assign_splits(tx, settings):
 
 def automatic_splits(frame, settings):
     # CORE LOGIC: STEP 1 — Allocate held-out date blocks and intervening embargo blocks.
-    # Input: ten dates, validation_fraction=.2, test_fraction=.2, embargo_dates=1.
-    # Output: Train dates1-4, Embargo5, Validation6-7, Embargo8, Test9-10.
-    # Explanation: Two validation and two test dates are reserved, then embargo dates precede both.
-    # Trick: Fractions operate on observed dates, not rows; calendar gaps are not filled with fake trading days.
+    # Input: ten dates, validation_dates=2, test_dates=2, embargo_dates=1, test_embargo_dates=0.
+    # Output: Train dates1-5, Embargo6, Validation7-8, Test9-10.
+    # Explanation: Explicit date counts override fractions; test_embargo_dates overrides only the gap before test.
+    # Trick: Counts/fractions use observed dates, not rows; omitted test embargo inherits embargo_dates.
     days = frame.time.dt.normalize()
     dates = sorted(days.unique())
-    n_val = max(1, int(np.ceil(len(dates)*settings.validation_fraction)))
-    n_test = max(1, int(np.ceil(len(dates)*settings.test_fraction))) if settings.test_fraction else 0
+    n_val = settings.validation_dates or max(1, int(np.ceil(len(dates)*settings.validation_fraction)))
+    n_test = settings.test_dates or (max(1, int(np.ceil(len(dates)*settings.test_fraction))) if settings.test_fraction else 0)
+    test_gap = settings.embargo_dates if settings.test_embargo_dates is None else settings.test_embargo_dates
     test_start = len(dates)-n_test
-    val_end = test_start-settings.embargo_dates if n_test else len(dates)
+    val_end = test_start-test_gap if n_test else len(dates)
     val_start = val_end-n_val
     train_end = val_start-settings.embargo_dates
     # VALIDATION LOGIC: Short datasets need an explicit feasible policy, never a randomized fallback.
     if train_end < settings.min_train_dates:
         raise ValueError('Too few dates for train/embargo/validation/test. Supply more history, reduce fractions/embargo, '
-                         'set test_fraction=0, or provide an explicit chronological split column.')
+                         'reduce date counts, set test_fraction=0 without test_dates, or provide an explicit chronological split column.')
     # CORE LOGIC: STEP 2 — Assign each transaction by its local date while preserving input order.
     # Input: dates1-10 allocation above; input transaction dates=[9,2,6,5].
-    # Output: split=['Test','Train','Validation','Embargo'] in the same input order.
+    # Output: split=['Test','Train','Embargo','Train'] in the same input order.
     # Explanation: Date membership labels every row; a busy date never straddles model stages.
     # Trick: Features may use causal historical observations from embargo dates, but their labels never train a model.
     labels = pd.Series('Embargo', index=frame.index)
@@ -114,7 +126,7 @@ def category_values(values, order):
     return sorted(categories) if order == 'sorted' else categories
 
 
-def prepare_schema(train, columns, category_order='sorted'):
+def prepare_schema(train, columns, category_order='sorted', categorical_features=None):
     # VALIDATION LOGIC: Explicit features cannot directly contain the target or generated predictions/stages.
     if not columns or len(set(columns)) != len(columns) or any(c not in train for c in columns):
         raise ValueError('Base/model features must be a nonempty, unique list of existing columns.')
@@ -122,20 +134,23 @@ def prepare_schema(train, columns, category_order='sorted'):
         raise ValueError('Target, identity, time and split columns cannot be model features.')
     if category_order not in {'sorted', 'appearance'}:
         raise ValueError('category_order must be sorted or appearance.')
+    if categorical_features is not None and (len(set(categorical_features)) != len(categorical_features) or set(categorical_features)-set(columns)):
+        raise ValueError('Categorical features must be a unique subset of the supplied feature columns.')
+    if any(pd.api.types.is_datetime64_any_dtype(train[column]) for column in columns):
+        raise ValueError('Convert timestamp features to explicitly causal numeric features before running the engine.')
     # CORE LOGIC: STEP 1 — Learn categorical vocabularies using training rows only.
-    # Input: train sector=['Energy','Bank',None,'Energy']; category_order='appearance'; validation has 'TMT'.
-    # Output: schema sector={'kind':'category','categories':['Energy','Bank']}; TMT is not learned.
-    # Explanation: First appearance preserves training category codes; default 'sorted' returns ['Bank','Energy'].
-    # Trick: New categories later map to missing, rather than changing integer codes or reading test metadata.
+    # Input: train side=[2,1,None], amount=['5','bad','7']; categorical_features=['side'], category_order='sorted'.
+    # Output: side={'kind':'category','categories':['1.0','2.0']}, amount={'kind':'numeric'}.
+    # Explanation: Numeric side codes are categorical by request; amount is numeric and 'bad' becomes NaN when encoded.
+    # Trick: [] forces every feature numeric; None retains dtype inference. Unseen/missing categories map to missing at prediction.
     schema = {}
     for column in columns:
         values = train[column]
-        if pd.api.types.is_datetime64_any_dtype(values):
-            raise ValueError(f'Convert timestamp feature {column!r} to an explicitly causal numeric feature first.')
-        if pd.api.types.is_numeric_dtype(values):
-            schema[column] = {'kind': 'numeric'}
-        else:
+        categorical = column in categorical_features if categorical_features is not None else not pd.api.types.is_numeric_dtype(values)
+        if categorical:
             schema[column] = {'kind': 'category', 'categories': category_values(values, category_order)}
+        else:
+            schema[column] = {'kind': 'numeric'}
     return schema
 
 
@@ -175,7 +190,7 @@ def variants(base_features, groups):
     return result
 
 
-def fit_models(frame, definitions, params, settings, progress):
+def fit_models(frame, definitions, params, settings, progress, base_cat_features=None):
     # CORE LOGIC: STEP 1 — Fit every candidate on exactly the same finite-label training rows.
     # Input: stages=['Train','Train','Validation'], target=[1,NaN,5].
     # Output: training row positions=[0]; validation target5 is never passed to fit.
@@ -194,7 +209,7 @@ def fit_models(frame, definitions, params, settings, progress):
     models = {}
     for index, (name, columns) in enumerate(definitions.items()):
         progress('models', index, len(definitions), f'Fitting {name} on {len(train):,} training records')
-        schema = prepare_schema(train, columns, settings.category_order)
+        schema = prepare_schema(train, columns, settings.category_order, base_cat_features)
         estimator = LGBMRegressor(**defaults)
         estimator.fit(encode(train, schema), train.target)
         models[name] = {'estimator': estimator, 'schema': schema, 'features': columns}
@@ -202,23 +217,33 @@ def fit_models(frame, definitions, params, settings, progress):
     return models
 
 
-def predict_stage(frame, models, stage, settings, actual_column=None):
+def predict_stage(frame, models, stage, settings, actual_column=None, adjustment_column=None):
+    # VALIDATION LOGIC: A mapped adjustment has one explicit algebraic convention, supported only for delta targets.
+    if adjustment_column is not None and settings.target_mode != 'delta':
+        raise ValueError('rollover_adjustment requires target_mode="delta"; level targets need no anchor restoration.')
+    if adjustment_column is not None and not np.isfinite(frame[adjustment_column]).all():
+        raise ValueError('Configured rollover_adjustment must be finite for every transaction.')
     # CORE LOGIC: STEP 1 — Select one declared evaluation stage, retaining invalid-label rows for coverage.
-    # Input: rows=(7,Validation,target1,anchor10,actual12),(8,Test,2,10,12),(9,Validation,NaN,10,NaN), delta mode, actual_column='actual'.
-    # Output: evaluation row_id=[7,9]; actual_level=[12,NaN], not inferred [11,NaN].
-    # Explanation: Explicit realized outcomes take precedence even when the fitted delta includes an adjustment.
-    # Trick: With no actual mapping, the original target (level) or target+anchor (delta) convention applies.
+    # Input: Validation row target=3, anchor=100, rollover_adjustment=2, actual=101; delta mode and both mappings supplied.
+    # Output: one evaluation row with actual_level=101; without actual mapping 3+100-2 also gives 101.
+    # Explanation: User-supplied target means actual-anchor+adjustment; explicit actual remains authoritative.
+    # Trick: An omitted adjustment mapping means zero even if an unrelated source column is named rollover_adjustment.
     output = frame.loc[frame.split.eq(stage)].copy()
+    adjustment = output[adjustment_column] if adjustment_column is not None else 0.
     output['actual_level'] = output.target
     if settings.target_mode == 'delta':
-        output['actual_level'] = output.target+output.anchor
+        output['actual_level'] = output.target+output.anchor-adjustment
     if actual_column is not None:
         output['actual_level'] = output[actual_column]
-    # INFERENCE LOGIC: Estimators only see their training-defined ordered features.
+    # CORE LOGIC: STEP 2 — Restore a predicted delta to spread units using the declared benchmark adjustment.
+    # Input: estimator predicts delta=4, anchor=100, rollover_adjustment=2, target_mode='delta'.
+    # Output: prediction=102; with no adjustment mapping the same delta and anchor yield 104.
+    # Explanation: Add the prior anchor and subtract the rollover offset used when the user constructed the target.
+    # Trick: No current realized outcome enters inference; estimators see only their fixed training schema.
     for name, model in models.items():
         output['prediction_'+name] = model['estimator'].predict(encode(output, model['schema']))
         if settings.target_mode == 'delta':
-            output['prediction_'+name] += output.anchor
+            output['prediction_'+name] += output.anchor-adjustment
     return output
 
 
@@ -233,7 +258,10 @@ def comparisons_for(predictions, config):
     return result
 
 
-def selection_population(predictions, settings):
+def selection_population(predictions, settings, config=None):
+    # CONFIGURATION LOGIC: In engine runs, optional metadata contributes only when explicitly mapped.
+    use_quantity = config is None or config.transactions.quantity is not None
+    use_maturity = config is None or config.transactions.maturity_years is not None or config.transactions.maturity_date is not None
     # CORE LOGIC: STEP 1 — Apply the predeclared business cohort, falling back explicitly if metadata is absent.
     # Input: quantity=[2MM,500K,1MM], maturity=[2,3,.5], selection_slice='large_long'.
     # Output: mask=[True,False,False], description='quantity>=1MM and maturity>1y'.
@@ -241,10 +269,10 @@ def selection_population(predictions, settings):
     # Trick: This condition is defined before evaluating losses; it is not the best-looking slice search.
     mask = pd.Series(True, index=predictions.index)
     description = 'all transactions'
-    if settings.selection_slice in {'large', 'large_long'} and 'QUANTITY' in predictions:
+    if settings.selection_slice in {'large', 'large_long'} and use_quantity and 'QUANTITY' in predictions:
         mask &= predictions.QUANTITY.ge(1e6)
         description = 'quantity>=1MM'
-        if settings.selection_slice == 'large_long' and 'MATURITY_YEARS' in predictions:
+        if settings.selection_slice == 'large_long' and use_maturity and 'MATURITY_YEARS' in predictions:
             mask &= predictions.MATURITY_YEARS.gt(1)
             description += ' and maturity>1y'
     return mask, description
@@ -272,7 +300,7 @@ def select_candidate(predictions, config, settings):
     # Output: fallback=True, chosen=[True,True,True].
     # Explanation: One priority record is below minimum support, so all three common validation rows are used.
     # Trick: Fallback is support-based, never based on whether its error gain looks better.
-    cohort, description = selection_population(predictions, settings)
+    cohort, description = selection_population(predictions, settings, config)
     chosen = common & cohort
     fallback = int(chosen.sum()) < settings.min_selection_rows
     if fallback:
