@@ -22,7 +22,7 @@ Run the notebook cells. They read and prepare the inputs, then open an editable 
 
 Use a fresh output folder for changed inputs or settings. Repeating an unchanged run reuses completed stages. The generated `report.html` contains this run's calculated tables and complete PNGs. No old predictions, hand-entered losses or research caches are required.
 
-The last cell defaults to `RUN_FINAL_TEST = False`. Enable it only after accepting the validation choice, then run that cell. Final test evaluates the original Train-fitted Base and frozen candidate; it does not reproduce the old notebook's pre-test refit.
+The last cell defaults to `RUN_FINAL_TEST = False`. Enable it only after accepting the validation choice, then run that cell. With the default single split, final test evaluates the original Train-fitted Base and frozen candidate. Optional walk-forward mode instead refits these two models on development after pooled validation selection. Neither path reproduces the old notebook's full research recipe.
 
 ## What the user prepares
 
@@ -112,3 +112,11 @@ If `TRADE_COUNTS_PREV_MONTH` exists, the example explicitly maps that field for 
 The fixed families are Base, Quote, Quote+Path and Quote+CrossBond. They differ from the old Quote levels / Reliability / Age decay chain. Review >=1MM trades, poor historical liquidity and prior-anchor/proxy discrepancies above 5 and 10 bps; separate short maturity and missing metadata. Any improvement is measured against the newly trained BASE15 on common records. A 5% practical threshold is not a significance test.
 
 Every table and chart comes from the supplied run. Synthetic verification checks software behavior and input contracts; it says nothing about real-data predictive gain. See [USAGE.md](USAGE.md) for custom slices, any pair of saved models, output artifacts and resuming completed work.
+
+## Optional walk-forward mode
+
+The example leaves `USE_WALK_FORWARD=False`. Keep that setting for the default single-split pilot, or set it True before displaying the form. Then review the actual fold date/count preview using **Validate inputs** before starting. Short inputs may support fewer complete folds than the requested limit or none; extend history or adjust explicit fold sizes if needed.
+
+The outer five-date Test remains reserved. Inner folds use earlier development dates, fresh four-model fits and training-only categories. Candidate choice uses pooled out-of-fold predictions; only Base and the selected candidate then refit on development. The budget is `4 × folds + 2` fits; quote events/features are built once. Inspect `cv_fold` in saved Validation review and the computed `cv_folds`, `cv_metrics` and `cv_stability` tables. Fold variation is descriptive, without automatic confidence intervals or significance claims. Upstream BASE rolling features must remain causal; CV cannot undo future information already included in prepared inputs.
+
+If a reliable label-release timestamp exists, map it in the walk-forward form. It is excluded from BASE features and controls training eligibility and final-origin OOF selection visibility. Saved `cv_label_available` and the manifest's excluded-label count disclose unscored outcomes. Without an issuer mapping, the `Quote+CrossBond` family label represents same-bond movement additions only; inspect actual support rather than inferring it from the name.

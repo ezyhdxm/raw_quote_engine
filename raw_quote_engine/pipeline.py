@@ -15,10 +15,11 @@ from .config import PipelineConfig
 from .ingest import normalize_transactions, normalize_quotes
 from .state import prepare_quote_events
 from .features import assemble_features, feature_dictionary
-from .training import TrainingConfig, assign_splits, variants, fit_models, predict_stage, comparisons_for, select_candidate
+from .training import TrainingConfig, assign_splits, variants, fit_models, predict_stage, comparisons_for, select_candidate, validate_model_parameters
 from .cache import Progress, StageCache, code_signature, fingerprint, digest, write_json
 from .diagnostics import diagnostic_tables, diagnostic_view
 from .report import write_report
+from .validation import WalkForwardConfig, walk_forward_plan, run_walk_forward, final_training_frame
 
 
 @dataclass
@@ -50,10 +51,13 @@ class ResearchRun:
         frame = self.predictions[stage]
         options = {c.removeprefix('prediction_'): c for c in frame if c.startswith('prediction_')}
         config = PipelineConfig.from_dict(self.metadata['config'])
+        slices = default_slices(diagnostic_view(frame, config.to_dict(), preserve_priority_sources=False).columns)
+        if 'cv_fold' in frame:
+            slices.append(Slice('cv_fold', top_n=100, name='Walk-forward fold'))
         return show_comparison(frame, actual='actual_level', predictions=options,
             id_column='row_id', time_column='time', bond_column='cusip',
             error_scale=config.error_scale, unit=config.unit, timezone=config.timezone,
-            default_slices=default_slices(diagnostic_view(frame, config.to_dict(), preserve_priority_sources=False).columns))
+            default_slices=slices)
 
     def finalize_test(self):
         # EVALUATION LOGIC: This explicit call reuses the frozen validation choice and trained estimators.
@@ -61,11 +65,16 @@ class ResearchRun:
 
 
 def run_research(transactions, quotes, base_features, model_params, config, *, output='runs/research',
-                 base_cat_features=None, training=None, evaluate_test=False, cache_dir=None, progress=None, quote_universe=None):
+                 base_cat_features=None, training=None, evaluate_test=False, cache_dir=None, progress=None,
+                 quote_universe=None, walk_forward=None):
     """Run Steps 1–5. Existing completed stages resume only when data and settings match."""
     # CONFIGURATION LOGIC: Keep source mappings, feature definitions and model settings explicit.
     config = config if isinstance(config, PipelineConfig) else PipelineConfig.from_dict(config)
     training = training if isinstance(training, TrainingConfig) else TrainingConfig(**(training or {}))
+    walk_forward = walk_forward if isinstance(walk_forward, WalkForwardConfig) or walk_forward is None else WalkForwardConfig(**walk_forward)
+    if walk_forward is not None and walk_forward.label_available_column in base_features:
+        raise ValueError('Label availability timestamps are evaluation metadata, not baseline features.')
+    validate_model_parameters(model_params)
     if config.transactions.rollover_adjustment is not None and training.target_mode != 'delta':
         raise ValueError('A rollover_adjustment mapping requires target_mode="delta"; supply target=actual-anchor+adjustment.')
     notify = Progress(progress)
@@ -81,12 +90,17 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
     validate_features(tx, base_features, config, training, base_cat_features)
     raw, quote_audit = normalize_quotes(quotes, config, tx if quote_universe is None else quote_universe)
     tx = assign_splits(tx, training, use_supplied_split=config.transactions.split is not None)
+    if walk_forward is not None:
+        walk_forward_plan(tx, walk_forward, config.timezone)
     # CACHEING LOGIC: Numerical code, full-precision input contents and explicit settings identify this run.
     numerical = code_signature(['ingest.py', 'state.py', 'movement.py', 'path.py', 'features.py'])
     event_key = digest(fingerprint(raw), code_signature(['state.py']), version('pandas'), version('numpy'))
     feature_key = digest(fingerprint(tx), event_key, config.to_dict(), numerical)
     library_versions = {name: version(name) for name in ('pandas', 'numpy', 'lightgbm')}
-    model_key = digest(feature_key, base_features, base_cat_features, model_params, training.to_dict(), code_signature(['training.py']), library_versions)
+    model_inputs = [feature_key, base_features, base_cat_features, model_params, training.to_dict(), code_signature(['training.py']), library_versions]
+    if walk_forward is not None:
+        model_inputs += [walk_forward.to_dict(), code_signature(['validation.py', '../bond_pricer/walk_forward.py'])]
+    model_key = digest(*model_inputs)
     receipt = output/'manifest.json'
     if receipt.exists() and json.loads(receipt.read_text()).get('run_key') != model_key:
         raise ValueError('This output directory belongs to different inputs/settings. Choose a new output directory; shared caches remain reusable.')
@@ -100,6 +114,7 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
         notify('report', 1, 1, 'Reusing complete run: '+str(run.report))
         return finalize_test(output, progress=progress) if evaluate_test else run
     metadata = manifest(config, training, model_key, feature_key, model_params, base_features, tx_audit, quote_audit, base_cat_features)
+    metadata['walk_forward'] = None if walk_forward is None else walk_forward.to_dict()
     write_json(receipt, metadata)
     # ORCHESTRATION LOGIC: One event aggregation feeds state, movement, path and diagnostic calculations.
     events = cache.get('step2_events', event_key, lambda: prepare_quote_events(raw, notify))
@@ -109,16 +124,32 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
     tables['feature_dictionary'] = feature_dictionary(frame, feature_meta['groups'], config)
     tables['splits'] = split_table(frame)
     definitions = variants(base_features, feature_meta['groups'])
-    # MODELING LOGIC: Training cache reuse avoids repeated fitting when a user only needs another slice/report.
-    models = cache.get('step5_models', model_key, lambda: fit_models(frame, definitions, model_params, training, notify, base_cat_features))
+    # MODELING LOGIC: The optional fold path reuses the same feature frame and persists completed folds independently.
     actual_column = 'actual' if config.transactions.actual is not None else None
     adjustment_column = 'rollover_adjustment' if config.transactions.rollover_adjustment is not None else None
-    validation = cache.get('step5_validation', model_key, lambda: predict_stage(frame, models, 'Validation', training, actual_column, adjustment_column))
+    if walk_forward is None:
+        models = cache.get('step5_models', model_key, lambda: fit_models(frame, definitions, model_params, training, notify, base_cat_features))
+        validation = cache.get('step5_validation', model_key, lambda: predict_stage(frame, models, 'Validation', training, actual_column, adjustment_column))
+    else:
+        validation, fold_tables = run_walk_forward(frame, definitions, model_params, training, config,
+            walk_forward, cache, model_key, notify, base_cat_features)
+        tables.update(fold_tables)
     selected = select_candidate(validation, config, training)
+    if walk_forward is not None:
+        selected.update(validation_policy='Pooled nonoverlapping out-of-fold predictions; record-weighted selection',
+            fit_policy='Fresh model per fold; after selection, refit Base and frozen candidate on development history only')
+        selected['unavailable_validation_labels'] = int((~validation.cv_label_available).sum()) if 'cv_label_available' in validation else None
     # FILE IO LOGIC: Commit the validation decision before any test predictions or test loss calculations.
+    write_json(output/'selection.json', selected)
+    if walk_forward is not None:
+        final_frame = final_training_frame(frame, walk_forward, config.timezone)
+        final_definitions = {name: definitions[name] for name in ('Base', selected['selected'])}
+        models = cache.get('step5_final_models', model_key, lambda: fit_models(
+            final_frame, final_definitions, model_params, training, notify, base_cat_features))
+        tables['cv_final_fit'] = split_table(final_frame)
+        metadata['cv_fit_count'] = 4*len(tables['cv_folds'])+2
     metadata.update(selection=selected, feature_groups=feature_meta['groups'], status='validation_complete',
                     effective_model_params=models['Base']['estimator'].get_params())
-    write_json(output/'selection.json', selected)
     frame.to_parquet(output/'features.parquet', index=False)
     validation.to_parquet(output/'predictions_validation.parquet', index=False)
     save_models(output, models, model_key)
@@ -140,11 +171,13 @@ def validate_features(tx, base_features, config, training, base_cat_features=Non
         raise ValueError('At least one valid transaction is required.')
     if not base_features or len(set(base_features)) != len(base_features) or set(base_features)-set(tx):
         raise ValueError('Provide a nonempty, unique list of existing base feature columns.')
-    if set(base_features) & {config.transactions.target, config.transactions.actual, 'target', 'actual'}:
-        raise ValueError('Target and actual outcome columns cannot be base features.')
+    forbidden = {config.transactions.target, config.transactions.actual, config.transactions.id,
+                 config.transactions.time, config.transactions.split, 'target', 'actual', 'row_id', 'time', 'split'}
+    if set(base_features) & forbidden:
+        raise ValueError('Target, actual outcome, identity, timestamp and split columns cannot be base features.')
     if base_cat_features is not None and (len(set(base_cat_features)) != len(base_cat_features) or set(base_cat_features)-set(base_features)):
         raise ValueError('base_cat_features must be a unique subset of base_features; [] explicitly means all numeric.')
-    reserved = [c for c in tx if c.startswith(('bcq_', 'prediction_', '__')) or c in {'actual_level', 'prior_trade_count_30d', 'history_days_available', 'history_30d_complete'}]
+    reserved = [c for c in tx if c.startswith(('bcq_', 'prediction_', 'cv_', '__')) or c in {'actual_level', 'prior_trade_count_30d', 'history_days_available', 'history_30d_complete'}]
     if reserved:
         raise ValueError(f'Rename source columns reserved for generated research outputs: {reserved}')
     if training.target_mode == 'delta' and (config.transactions.anchor is None or 'anchor' not in tx or tx.anchor.isna().any()):
@@ -160,7 +193,7 @@ def manifest(config, training, key, feature_key, params, base, tx_audit, quote_a
                           prediction='predicted_level' if training.target_mode == 'level' else restoration,
                           actual='mapped actual column' if config.transactions.actual is not None else ('target' if training.target_mode == 'level' else restoration.replace('predicted_delta', 'target')),
                           omitted_rollover_adjustment=0, adjustment_available_at_prediction_time='caller responsibility')
-    return dict(engine_version='0.2.0', run_key=key, feature_key=feature_key, synthetic=config.synthetic,
+    return dict(engine_version='0.3.0', run_key=key, feature_key=feature_key, synthetic=config.synthetic,
                 config=config.to_dict(), training=training.to_dict(), base_features=list(base), model_params=params,
                 base_cat_features=None if base_cat_features is None else list(base_cat_features),
                 reconstruction=reconstruction,

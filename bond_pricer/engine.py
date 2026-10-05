@@ -14,7 +14,8 @@ class Comparison:
         self.data, self.rows, self.coverage, self.config = data, rows, coverage, config
         self.reference_name, self.candidate_name = config['reference_name'], config['candidate_name']
         self.unit, self.tolerance = config['unit'], config['tolerance']
-        self.default_slices = default_slices(rows.columns)
+        self.default_slices = [spec for spec in default_slices(rows.columns)
+                               if config['time_column'] is not None or spec.column not in {'__date', '__hour'}]
         self.filter_history = []
 
     def summary(self, min_count=30):
@@ -122,7 +123,7 @@ def compare_predictions(data, actual, reference, candidate, *, reference_name=No
     # VALIDATION LOGIC: Empty comparisons are represented explicitly; invalid configuration is an error.
     if not np.isfinite(tolerance) or tolerance < 0:
         raise ValueError('tolerance must be a nonnegative finite value in the displayed error unit.')
-    frame = read_data(data)
+    frame = read_data(data, string_columns=[id_column, bond_column])
     reference_name, candidate_name = reference_name or reference, candidate_name or candidate
     if reference_name == candidate_name:
         raise ValueError('Use two distinct model display names.')
@@ -167,7 +168,7 @@ def _predict(frame, model):
 def compare_models(data, actual, reference, candidate, **kwargs):
     """Run predict on two already-fitted Model objects with different feature sets if needed."""
     # VALIDATION LOGIC: Prediction metadata must not conflict with caller-supplied comparison arguments.
-    frame = read_data(data)
+    frame = read_data(data, string_columns=[kwargs.get('id_column'), kwargs.get('bond_column')])
     columns = ['Reference prediction','Candidate prediction']
     if set(columns) & set(frame):
         raise ValueError('Rename existing Reference prediction/Candidate prediction columns first.')

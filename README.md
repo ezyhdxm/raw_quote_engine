@@ -44,16 +44,22 @@ run = run_research(
 
 A CLI configuration is shown in [examples/config.json](examples/config.json). Its paths and columns are illustrative. For a synthetic smoke report: `python -m raw_quote_engine.cli demo --output runs/synthetic_demo`.
 
+## Optional walk-forward validation
+
+The form defaults to **Single split**. Select **Walk forward**, configure the minimum training history, validation block, embargo and optional rolling cap, then click **Validate inputs** to review exact fold dates, row counts and the fit budget. The final Test reservation still comes from the outer split; it never enters a CV fold.
+
+Each fold fits fresh models and learns categories only from its training rows. An optional label-known-time column purges training labels unavailable at each fold origin and masks OOF outcomes still unavailable at the final selection origin. Pooled out-of-fold predictions select the candidate; Base and that candidate are then refitted on development history (using the rolling cap when configured). The budget is `4 × folds + 2` fits, while quote events and causal features are built once. Reports include per-fold metrics and stability; confidence intervals and significance are not inferred automatically. See [the walk-forward guide](docs/USAGE.md#optional-walk-forward-validation).
+
 ## What the run produces
 
 - An English report, complete PNG figures, exact CSV diagnostics and a feature dictionary.
 - Causal per-transaction features, saved predictions and native LightGBM models.
-- Four fixed families: Base, Quote, Quote+Path and Quote+CrossBond; no fitted latent-factor model is implied.
+- Four fixed families: Base, Quote, Quote+Path and Quote+CrossBond. The last needs an issuer mapping for other-bond features; otherwise it adds same-bond movement only. No fitted latent-factor model is implied.
 - Common-record MAE, RMSE, P95, bias, win rate, coverage and descriptive date stability.
 - Any pair of saved models, arbitrary metadata slices, two-column heatmaps and custom exports.
 - Optional quantity, maturity, history and prior-anchor/proxy slices when their input contracts are supplied.
 - Frozen validation selection, input fingerprints, category schemas and resumable stage caches.
 
-No-quote transactions, zero/negative spreads, unknown sizes, simultaneous candidates and crossings remain visible. Candidate clipping and dealer downweighting are diagnostics, not destructive source cleaning. Final test requires an explicit action after validation and reuses the Train-fitted Base and selected candidate.
+No-quote transactions, zero/negative spreads, unknown sizes, simultaneous candidates and crossings remain visible. Candidate clipping and dealer downweighting are diagnostics, not destructive source cleaning. Final test requires an explicit action after validation. Single-split runs reuse the Train fits; optional walk-forward runs refit only Base and the selected candidate on development history before final test.
 
 Read [USAGE.md](docs/USAGE.md), [DATA_CONTRACT.md](docs/DATA_CONTRACT.md) and [BONDCLIQ_LESSONS.md](docs/BONDCLIQ_LESSONS.md). Source-specific preprocessing stays in the user's notebook; data, caches, models and generated reports stay local.

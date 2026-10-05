@@ -12,7 +12,7 @@ from pathlib import Path
 from html import escape
 import pandas as pd
 from IPython.display import HTML, display
-from raw_quote_engine import PipelineConfig, TransactionColumns, QuoteColumns, TrainingConfig, research_form, Slice
+from raw_quote_engine import PipelineConfig, TransactionColumns, QuoteColumns, TrainingConfig, WalkForwardConfig, research_form, Slice
 from raw_quote_engine.demo import demo_inputs
 
 # CONFIGURATION LOGIC: Set False and edit the real-data branch to supply your own prepared DataFrames.
@@ -40,6 +40,9 @@ else:
     )
 training = TrainingConfig(target_mode='level', validation_fraction=.2, test_fraction=.2,
                           embargo_dates=1, test_embargo_dates=1, min_train_dates=3)
+# CONFIGURATION LOGIC: Optional inner folds keep the outer final Test reserved; default remains single split.
+USE_WALK_FORWARD = False
+walk_forward = WalkForwardConfig(min_train_dates=4, validation_dates=2, embargo_dates=1, n_splits=3) if USE_WALK_FORWARD else None
 
 # %% [markdown]
 # ## Configure and run
@@ -52,18 +55,28 @@ training = TrainingConfig(target_mode='level', validation_fraction=.2, test_frac
 # Supply all upstream feature engineering, sector/proxy metadata, quantity scales
 # and benchmark adjustments yourself. Zero/negative spreads, unknown sizes,
 # simultaneous candidates and crossings remain diagnostic information.
+#
+# Optional Walk forward mode previews inner training/validation dates and counts
+# before Run. Each fold fits four fresh models; pooled out-of-fold predictions
+# select a candidate, then Base and that candidate refit on development. Cost is
+# 4 × folds + 2 fits, with quote features computed once. The outer Test stays
+# reserved. A rolling training cap is optional; no confidence interval is implied.
+# Optional label-known time controls both fold Train and OOF label availability
+# at the final selection origin. It cannot be a BASE feature. Without an issuer
+# mapping, Quote+CrossBond adds same-bond movement only; inspect actual support.
 
 # %%
 # UI LOGIC: Validate is read-only preflight; Run validation starts Steps 1–5 on the applied settings.
 controller = research_form(transactions_df, quotes_df, BASE_FEATURES, BASE_CAT_FEATURES,
-                           LGB_PARAMS, config=config, training=training, output=OUTPUT)
+                           LGB_PARAMS, config=config, training=training, output=OUTPUT, walk_forward=walk_forward)
 
 # %% [markdown]
 # ## Review after the form completes
 #
 # Run this cell after validation finishes. It reads saved predictions without
 # refitting and exposes model selectors, custom slices, two intersecting filters
-# and two-column heatmaps. Missing metadata remains unsupported.
+# and two-column heatmaps. Missing metadata remains unsupported. Walk-forward
+# validation adds cv_fold as a slice and cv_folds/cv_metrics/cv_stability tables.
 
 # %%
 # UI LOGIC: Avoid a premature review call when Run All has only displayed the configuration form.
@@ -94,7 +107,8 @@ if EXPORT_CUSTOM and controller.run is not None:
 # ## Explicit final test
 #
 # Review validation first, then enable this cell. Only Base and the frozen candidate
-# are evaluated using their original Train fits. The engine cannot establish that
+# are evaluated: single split reuses Train fits; walk forward uses the two
+# post-selection development refits. The engine cannot establish that
 # someone has never inspected the same dates before.
 #
 # Reopen a saved run with `load_run('runs/notebook_research')`. Regenerate its HTML

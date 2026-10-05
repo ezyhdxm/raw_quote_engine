@@ -8,8 +8,11 @@ import pandas as pd
 import ipywidgets as w
 from IPython.display import display
 from .config import PipelineConfig, QuoteColumns, TransactionColumns
-from .training import TrainingConfig
+from .training import TrainingConfig, validate_model_parameters
 from .pipeline import run_research
+from .ingest import _times, _split
+from .training import assign_splits
+from bond_pricer.walk_forward import WalkForwardConfig
 
 
 def _frame_columns(frame, label):
@@ -36,13 +39,14 @@ def _feature_list(values, columns, label):
 class ResearchForm:
     """Editable configuration, structural preflight, and an explicit validation-run button.
 
-    ``validate()`` raises on invalid mappings but does not scan all records or train.
+    ``validate()`` checks mappings and, for walk-forward, scans only times/split labels to preview folds.
     ``start()`` performs full engine checks and returns a ResearchRun. Errors also appear
     inline, and controls are restored even when validation or fitting fails.
     """
     # UI LOGIC: Retain references to supplied frames; the engine owns any work copies when Start is pressed.
     def __init__(self, transactions_df, quotes_df, base_features, base_cat_features, model_params,
-                 *, config=None, training=None, output='runs/research', cache_dir=None, quote_universe=None):
+                 *, config=None, training=None, output='runs/research', cache_dir=None, quote_universe=None,
+                 walk_forward=None):
         self.transactions, self.quotes = transactions_df, quotes_df
         self.quote_universe = quote_universe
         self.tx_columns = _frame_columns(transactions_df, 'transactions_df')
@@ -55,12 +59,17 @@ class ResearchForm:
         default_training = TrainingConfig(selection_slice='all', apply_model_defaults=False)
         self._training = default_training.to_dict()
         self._training.update(training.to_dict() if isinstance(training, TrainingConfig) else dict(training or {}))
+        self._walk_forward = asdict(walk_forward) if isinstance(walk_forward, WalkForwardConfig) else dict(walk_forward or {})
+        self._use_walk_forward = walk_forward is not None
         self.controls, self.run, self.running = {}, None, False
+        self.fold_preview, self._preview_token = pd.DataFrame(), None
         self.status, self.progress = w.HTML(), w.FloatProgress(min=0, max=1, value=0)
+        self.fold_output = w.HTML()
         self.review_output = w.Output()
         self._make_mappings()
         self._make_features(base, categorical, model_params)
         self._make_settings(output, cache_dir)
+        self._make_walk_forward_controls()
         self._make_widget()
 
     def _add(self, key, control):
@@ -172,6 +181,34 @@ class ResearchForm:
             self._add(name, w.Text(value='' if initial is None else str(initial), description=label+':',
                                   placeholder='Blank = use fraction / shared embargo'))
 
+    def _make_walk_forward_controls(self):
+        # UI LOGIC: Single split stays the default; inner folds never reserve a second final holdout.
+        self._add('evaluation_mode', w.Dropdown(options=[('Single split', 'single'), ('Walk forward', 'walk_forward')],
+                  value='walk_forward' if self._use_walk_forward else 'single', description='Validation design:'))
+        defaults = {'min_train_dates': self._training['min_train_dates'], 'validation_dates': 2, 'embargo_dates': 0}
+        labels = {'min_train_dates': 'Initial training dates', 'validation_dates': 'Validation dates per fold',
+                  'embargo_dates': 'Fold embargo dates'}
+        for name, default in defaults.items():
+            self._add('wf_'+name, w.IntText(value=self._walk_forward.get(name, default), description=labels[name]+':'))
+        for name, label in [('step_dates', 'Fold step dates'), ('max_train_dates', 'Rolling training cap'),
+                            ('n_splits', 'Number of folds (limit)')]:
+            value = self._walk_forward.get(name)
+            self._add('wf_'+name, w.Text(value='' if value is None else str(value), description=label+':',
+                                        placeholder='Blank = default / no limit'))
+        self._column('wf_label_available_column', 'Label known time (optional)', self.tx_columns,
+                     self._walk_forward.get('label_available_column'))
+        self.controls['evaluation_mode'].observe(self._walk_forward_changed, names='value')
+        self._walk_forward_changed()
+
+    def _walk_forward_changed(self, change=None):
+        # UI LOGIC: Preserve fold settings when switching modes, but require a new preview before a fold run.
+        enabled = self.controls['evaluation_mode'].value == 'walk_forward'
+        for name, control in self.controls.items():
+            if name.startswith('wf_'):
+                control.layout.display = '' if enabled else 'none'
+        self.fold_output.value = ''
+        self.fold_preview, self._preview_token = pd.DataFrame(), None
+
     def _section(self, keys, note=''):
         # UI LOGIC: Sections are compact and expandable; long source tables are never printed.
         children = [w.HTML(note)] if note else []
@@ -208,10 +245,18 @@ class ResearchForm:
                     '(zero when unmapped). Actual is an independent observed level; if absent, delta truth uses '
                     'target + anchor − adjustment. Explicit Train/Validation/Test/Embargo labels override date '
                     'allocation. This form never evaluates the reserved final test.'),
+            self._section(['evaluation_mode']+[name for name in self.controls if name.startswith('wf_')],
+                    'Walk forward reserves the outer Test above, then makes nonoverlapping validation folds on '
+                    'the earlier development history. Validate inputs previews every fold before training. '
+                    'Expanding history is the default; a rolling cap limits training dates. '
+                    'Optional label-known time excludes unavailable/missing training labels at each fold origin '
+                    'and masks OOF outcomes unavailable before the final selection origin. '
+                    'Cost: four model fits per fold, then two development refits. Quote features are built once.'),
             self._section(['output', 'cache_dir'], 'Use a new run directory for changed settings. Completed matching stages reuse their cache.')]
+        sections[5].children += (self.fold_output,)
         accordion = w.Accordion(children=sections, selected_index=0)
         for index, title in enumerate(['1. Transactions', '2. Raw quotes', '3. Baseline model', '4. Units and quote settings',
-                                       '5. Chronological validation', '6. Save and resume']):
+                                       '5. Outer chronological split', '6. Optional walk forward', '7. Save and resume']):
             accordion.set_title(index, title)
         sections[4].children += (w.HTML('Optional prior-count mapping must already be known at prediction time; '
             'the sparse-history slice uses counts 0–14. If omitted, diagnostics use engine-computed trailing '
@@ -223,7 +268,7 @@ class ResearchForm:
         self.validate_button.on_click(self._validate_clicked)
         self.start_button.on_click(self._start_clicked)
         self.review_button.on_click(self._review_clicked)
-        self.status.value = 'Choose mappings, then Validate inputs. Validation here checks structure only; it does not train.'
+        self.status.value = 'Choose mappings, then Validate inputs. This checks structure and optional fold dates; it does not train.'
         self.widget = w.VBox([intro, accordion, w.HBox([self.validate_button, self.start_button, self.review_button]),
                               self.status, self.progress, self.review_output])
 
@@ -258,6 +303,74 @@ class ResearchForm:
                 raise ValueError(f'{name} must be a whole number or blank.') from exc
         return TrainingConfig(**values)
 
+    def walk_forward_configuration(self):
+        # CONFIGURATION LOGIC: Fold counts are literal integers; the outer split alone owns final-Test reservation.
+        if self.controls['evaluation_mode'].value == 'single':
+            return None
+        values = dict(self._walk_forward)
+        for name in ['min_train_dates', 'validation_dates', 'embargo_dates']:
+            values[name] = self.controls['wf_'+name].value
+        for name in ['step_dates', 'max_train_dates', 'n_splits']:
+            text = self.controls['wf_'+name].value.strip()
+            try:
+                values[name] = int(text) if text else None
+            except ValueError as exc:
+                raise ValueError(f'Walk-forward {name} must be a whole number or blank.') from exc
+        if values.get('holdout_dates', 0) != 0 or values.get('holdout_embargo_dates', 0) != 0:
+            raise ValueError('Raw quote research reserves Test through the outer split; inner holdout dates and embargo must be 0.')
+        values['holdout_dates'] = 0
+        values['label_available_column'] = self.controls['wf_label_available_column'].value
+        return WalkForwardConfig(**values)
+
+    def _preview_folds(self, config, training, walk_forward):
+        # UI LOGIC: Single-split validation retains its inexpensive structural preflight.
+        self.fold_preview, self.fold_output.value, self._preview_token = pd.DataFrame(), '', None
+        if walk_forward is None:
+            self._preview_token = None
+            return
+        # SETUP LOGIC: Reuse the backend's exact outer-development rule, without loading quotes or targets.
+        from .validation import walk_forward_plan
+        # CORE LOGIC: STEP 1 — Build only the declared transaction-time and outer-split calendar.
+        # Input: time=['2026-03-02 10:00','2026-03-03 10:00'], supplied split=['train','validation'], timezone=UTC.
+        # Output: calendar has UTC-aware times on March 2/3 and split=['Train','Validation']; no target is read.
+        # Explanation: Explicit labels take precedence; otherwise the existing outer date policy assigns them.
+        # Trick: Resetting the time index keeps source positions stable even if the DataFrame index has duplicates.
+        times = _times(self.transactions[config.transactions.time], config.timezone, 'transaction time').reset_index(drop=True)
+        if times.isna().any():
+            raise ValueError('Walk-forward preview needs valid prediction times; resolve missing times before running.')
+        calendar = pd.DataFrame({'time': times})
+        if config.transactions.split is not None:
+            calendar['split'] = _split(self.transactions[config.transactions.split]).to_numpy()
+        calendar = assign_splits(calendar, training)
+        # CORE LOGIC: STEP 2 — Carry optional label release times into the fold planner without reading targets.
+        # Input: label_available_column='released', source released=['2026-03-02 12:00',None].
+        # Output: calendar.released=['2026-03-02 12:00',None]; the planner excludes unknown releases from Train.
+        # Explanation: Source row positions align release times with the prediction-time calendar.
+        # Trick: Canonical split labels cannot also serve as a release timestamp; a mapped time field is already normalized.
+        available = walk_forward.label_available_column
+        if available == 'split' or (available == 'time' and config.transactions.time != 'time'):
+            raise ValueError('Rename the label release column: canonical time/split names must retain their mapped roles.')
+        if available is not None and available != 'time':
+            calendar[available] = self.transactions[available].to_numpy()
+        # CORE LOGIC: STEP 3 — Preview folds only within the outer development population.
+        # Input: one row/day 2026-01-01..08, outer Validation ends Jan6; min_train=2, validation=2, embargo=0.
+        # Output: fold1 trains Jan1-2/validates Jan3-4; fold2 trains Jan1-4/validates Jan5-6; Jan7-8 reserved.
+        # Explanation: The shared splitter uses no labels or predictions, and reports exact date/row support.
+        # Trick: Earlier outer embargo rows are development history; rows after outer Validation cannot enter CV.
+        development, folds = walk_forward_plan(calendar, walk_forward, config.timezone)
+        self.fold_preview = pd.DataFrame([fold.to_dict() for fold in folds])
+        # UI LOGIC: A small scrollable plan makes the fit budget and reserved population reviewable before Run.
+        count = len(folds)
+        budget = 4*count+2
+        self.fold_output.value = (f'<b>{count} folds; {budget} planned fits</b> '
+            f'({4*count} fold fits + 2 development refits). '
+            f'{len(development):,} development rows; {len(calendar)-len(development):,} rows reserved after outer Validation. '
+            'Counts describe supplied rows, not verified finite-label support. Quotes/features are calculated once.'
+            '<div style="max-height:340px;overflow:auto">'+self.fold_preview.to_html(index=False, escape=True)+'</div>')
+        self._preview_token = json.dumps([config.to_dict(), training.to_dict(), walk_forward.to_dict(),
+            self.fold_preview.to_dict('records')], sort_keys=True)
+        self.status.value += '<br><b>Fold preview ready.</b> Review the dates and fit budget in Optional walk forward before Run validation.'
+
     def _model_parameters(self):
         # CONFIGURATION LOGIC: Model parameters are plain JSON and are never evaluated as Python code.
         try:
@@ -270,8 +383,8 @@ class ResearchForm:
         return result
 
     def validate(self):
-        """Check configuration and schema only; return True or raise an actionable error."""
-        # VALIDATION LOGIC: No normalization, feature aggregation, model fitting, or full-table statistics occur here.
+        """Check mappings and preview optional fold dates without building features or fitting models."""
+        # VALIDATION LOGIC: Walk-forward preflight scans times/split labels only; no quote aggregation or fitting occurs.
         tx_columns = _frame_columns(self.transactions, 'transactions_df')
         quote_columns = _frame_columns(self.quotes, 'quotes_df')
         if self.transactions.empty:
@@ -294,10 +407,14 @@ class ResearchForm:
         if set(base) & forbidden:
             raise ValueError('Target, actual outcome, record ID, timestamp and split columns cannot be base features.')
         self._validate_contracts(config, training)
-        self._model_parameters()
+        walk_forward = self.walk_forward_configuration()
+        if walk_forward is not None and walk_forward.label_available_column in base:
+            raise ValueError('Label availability time controls training/selection eligibility and cannot be a BASE feature.')
+        validate_model_parameters(self._model_parameters())
         if not self.controls['output'].value.strip():
             raise ValueError('Choose an output directory.')
         self._show_mapping(config)
+        self._preview_folds(config, training, walk_forward)
         return True
 
     def _validate_contracts(self, config, training):
@@ -334,7 +451,7 @@ class ResearchForm:
                               for label, frame, column in fields)
         self.status.value = '<b>Structural checks passed.</b> '+f'{len(self.transactions):,} transaction rows; {len(self.quotes):,} raw quote rows. '
         self.status.value += 'Counts are input sizes, not verified eligible samples.<br>'+preview
-        self.status.value += '<br>Full key/time/numeric checks, chronological splits, quote support and model results are checked during Run validation.'
+        self.status.value += '<br>Full key/time/numeric checks, quote support and model results are checked during Run validation.'
 
     def _progress(self, stage, current, total, message):
         # UI LOGIC: Progress is stage-local; do not imply a measured overall ETA from unknown aggregation work.
@@ -350,13 +467,17 @@ class ResearchForm:
         self.running = True
         self.start_button.disabled = self.validate_button.disabled = self.review_button.disabled = True
         try:
+            previous_preview = self._preview_token
             self.validate()
             config, training = self.configuration(), self.training_configuration()
+            walk_forward = self.walk_forward_configuration()
+            if walk_forward is not None and previous_preview != self._preview_token:
+                raise ValueError('Review the new fold preview and fit budget, then click Run validation again. Changed dates/settings require this review before fitting.')
             self.run = run_research(self.transactions, self.quotes, list(self.controls['base_features'].value),
                 self._model_parameters(), config, base_cat_features=list(self.controls['base_cat_features'].value),
                 training=training, output=self.controls['output'].value.strip(),
                 cache_dir=self.controls['cache_dir'].value.strip() or None, progress=self._progress,
-                quote_universe=self.quote_universe, evaluate_test=False)
+                quote_universe=self.quote_universe, walk_forward=walk_forward, evaluate_test=False)
             self.status.value = '<b>Validation complete.</b> Report: '+escape(str(self.run.report))+'. Final test has not been requested by this form.'
             return self.run
         except Exception as exc:
@@ -395,11 +516,12 @@ class ResearchForm:
 
 
 def research_form(transactions_df, quotes_df, BASE_FEATURES, BASE_CAT_FEATURES, LGB_PARAMS,
-                  *, config=None, training=None, output='runs/research', cache_dir=None, quote_universe=None):
+                  *, config=None, training=None, output='runs/research', cache_dir=None, quote_universe=None,
+                  walk_forward=None):
     """Display once and return an editable ResearchForm; running remains a separate explicit action."""
     # UI LOGIC: Caller DataFrames are not printed, transformed, or fitted when the form is displayed.
     form = ResearchForm(transactions_df, quotes_df, BASE_FEATURES, BASE_CAT_FEATURES, LGB_PARAMS,
                         config=config, training=training, output=output, cache_dir=cache_dir,
-                        quote_universe=quote_universe)
+                        quote_universe=quote_universe, walk_forward=walk_forward)
     display(form.widget)
     return form

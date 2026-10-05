@@ -67,3 +67,9 @@ The generated report reads only the current run's computed tables, comparison ob
 Generic comparison exports contain aggregates by default. Raw diagnostics include local bond/dealer identities and a few exact event examples; review them before sharing. Run outputs, private inputs and local tests should remain outside source control.
 
 The engine cannot certify feed completeness, quote executability, source quantity units, original timestamp correctness, metadata availability at every historical instant, or causal reasons for every outlier. Its history-coverage flags establish only what is visible in supplied data. Reproducible output makes these assumptions inspectable; it does not remove them.
+
+## Walk-forward evidence and limits
+
+Repeated chronological validation tests sensitivity to which dates train and evaluate a model. Each fold needs fresh fits, training-only category vocabularies and nonoverlapping held-out records. Expanding and rolling history answer different deployment questions; declare the policy before examining fold results. The raw engine reserves the outer Test separately, selects on pooled out-of-fold validation records and refits only Base and the selected family on development before an explicit final test.
+
+Pooled loss gives every scored record its stated weight. Averaging fold MAEs without considering fold size answers a different question. Correlated securities and overlapping training windows prevent treating fold count as the number of independent experiments; descriptive fold stability is not a confidence interval. Reusing causal quote features avoids redundant aggregation, but supplied baseline features can still leak if their upstream rolling calculations used future information.

@@ -3,6 +3,7 @@
 from html import escape
 from io import BytesIO
 import numpy as np
+from pandas.api.types import is_numeric_dtype
 import ipywidgets as w
 from IPython.display import display
 from .data import read_data
@@ -59,6 +60,7 @@ class ComparisonPanel:
         self.prediction_mapping = predictions
         self.anchors = dict(reference_anchor=reference_anchor,candidate_anchor=candidate_anchor)
         self.initial_filters = []
+        self.initial_names = None
         if isinstance(data,Comparison):
             existing = data
             actual, id_column = existing.config['actual'], existing.config['id_column']
@@ -69,8 +71,9 @@ class ComparisonPanel:
             self.prediction_mapping = predictions
             self.anchors = {k:existing.config[k] for k in ['reference_anchor','candidate_anchor']}
             self.initial_filters = list(existing.filter_history)
+            self.initial_names = (existing.reference_name, existing.candidate_name)
             data = existing.data
-        self.data = read_data(data) if data is not None else None
+        self.data = read_data(data, string_columns='all') if data is not None else None
         self.path = w.Text(description='Data path:',placeholder='Local CSV / Parquet path',layout=w.Layout(width='80%'))
         self.load = w.Button(description='Load data',button_style='info')
         self.load.on_click(self.load_data)
@@ -131,21 +134,32 @@ class ComparisonPanel:
         if not set(mapping.values()).issubset(columns):
             raise ValueError('A configured prediction column does not exist in this data.')
         self.mapping = mapping
-        if not self.anchor_mapping:
-            self.anchor_mapping = dict(zip(list(mapping)[:2],[self.anchors['reference_anchor'],self.anchors['candidate_anchor']]))
         self.reference.options = self.candidate.options = list(mapping)
-        self.reference.value = next((c for c in ['BASE','Base','base_prediction','pred_base','Reference prediction'] if c in mapping),list(mapping)[0])
+        preferred_reference = self.initial_names[0] if self.initial_names else None
+        self.reference.value = preferred_reference or next((c for c in ['BASE','Base','base_prediction','pred_base','Reference prediction'] if c in mapping),list(mapping)[0])
         others = [c for c in mapping if c != self.reference.value]
-        self.candidate.value = next((c for c in ['Candidate','candidate_prediction','new_prediction','pred_new','Candidate prediction'] if c in others),others[0])
+        preferred_candidate = self.initial_names[1] if self.initial_names else None
+        self.candidate.value = preferred_candidate or next((c for c in ['Candidate','candidate_prediction','new_prediction','pred_new','Candidate prediction'] if c in others),others[0])
+        if not self.anchor_mapping:
+            self.anchor_mapping = {self.reference.value:self.anchors['reference_anchor'],
+                                   self.candidate.value:self.anchors['candidate_anchor']}
         for control,value,aliases in [(self.identity,identity,['row_id','trade_id']),(self.time,time,['time','EFFECTIVE_DATETIME_TS','timestamp']),
                                       (self.bond,bond,['CUSIP','cusip','bond_id'])]:
             control.options = [('Not supplied',None)]+[(str(c),c) for c in columns]
             control.value = value if value in columns else next((c for c in aliases if c in columns),None)
-        self.defaults = {s.column:s for s in (self.supplied_slices or default_slices(columns))}
-        slice_columns = columns+['__hour','__date']
+        supplied = self.supplied_slices
+        defaults = supplied if supplied is not None else default_slices(columns)
+        defaults = [spec for spec in defaults if self.time.value is not None or spec.column not in {'__hour', '__date'}]
+        self.defaults = {s.column:s for s in defaults}
+        slice_columns = list(dict.fromkeys(columns+(['__hour','__date'] if self.time.value else [])))
         self.first.options = [(str(c),c) for c in slice_columns]
         self.second.options = [('None',None)]+[(str(c),c) for c in slice_columns]
-        self.first.value = next(iter(self.defaults),columns[0])
+        predicted = set(mapping.values()) if self.prediction_mapping else {mapping[self.reference.value],mapping[self.candidate.value]}
+        excluded = predicted | {self.actual.value,self.identity.value,self.time.value,self.bond.value}
+        metadata = [c for c in columns if c not in excluded]
+        categorical = [c for c in metadata if not is_numeric_dtype(self.data[c])]
+        preferred = next(iter(categorical or metadata), columns[0])
+        self.first.value = next(iter(self.defaults), preferred)
         self.second.value = None
         self.set_bins(self.first,self.first_bins,self.first_right)
         for item in self.filters:
@@ -161,9 +175,10 @@ class ComparisonPanel:
     def load_data(self, _=None):
         # FILE IO LOGIC: Replace the input only on an explicit load; preserve the applied result on error.
         try:
-            data = read_data(self.path.value)
+            data = read_data(self.path.value, string_columns='all')
             self.data = data
             self.initial_filters = []
+            self.initial_names = None
             self.prediction_mapping,self.anchor_mapping = None,{}
             self.anchors = dict(reference_anchor=None,candidate_anchor=None)
             self.configure()

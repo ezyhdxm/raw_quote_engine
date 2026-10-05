@@ -17,7 +17,7 @@ from html import escape
 import numpy as np
 import pandas as pd
 from IPython.display import HTML, display
-from raw_quote_engine import PipelineConfig, TransactionColumns, QuoteColumns, TrainingConfig, research_form
+from raw_quote_engine import PipelineConfig, TransactionColumns, QuoteColumns, TrainingConfig, WalkForwardConfig, research_form
 
 # CONFIGURATION LOGIC: Change the two paths; prepared data_ig already contains upstream BASE features.
 DATA_IG_FILE = Path("data/pipeline/data_ig.parquet")
@@ -146,9 +146,12 @@ training = TrainingConfig(
     validation_dates=5, test_dates=5, embargo_dates=2, test_embargo_dates=0, min_train_dates=10,
     target_mode='delta', category_order='appearance', apply_model_defaults=False, selection_slice='large_long',
 )
+# CONFIGURATION LOGIC: Optional CV folds use development only; outer Test reservation stays in training above.
+USE_WALK_FORWARD = False
+walk_forward = WalkForwardConfig(min_train_dates=10, validation_dates=2, embargo_dates=2, n_splits=3) if USE_WALK_FORWARD else None
 # UI LOGIC: Opening the form does not train; inspect mappings and click Validate, then Run validation.
 controller = research_form(model_data, bcq_df, BASE_FEATURES, BASE_CAT_FEATURES, LGB_PARAMS,
-                           config=config, training=training, output=OUTPUT, quote_universe=quote_universe)
+                           config=config, training=training, output=OUTPUT, quote_universe=quote_universe, walk_forward=walk_forward)
 
 # %% [markdown]
 # ## Target reconstruction and review
@@ -166,6 +169,13 @@ controller = research_form(model_data, bcq_df, BASE_FEATURES, BASE_CAT_FEATURES,
 #
 # Once the form finishes, run the cell below to inspect saved validation results.
 # Review >=1MM, weak-liquidity and >5/10-bps anchor-gap groups; separate <1y maturity.
+#
+# Optional Walk forward mode requires inspecting the date/count preview before
+# Run. It adds pooled out-of-fold Validation predictions with cv_fold and
+# cv_folds/cv_metrics/cv_stability tables. Budget: 4 × folds + 2 fits; quote
+# features run once. A short dataset can have fewer complete folds than the limit.
+# Upstream BASE rolling features must still be causal; no confidence interval or
+# significance follows automatically from variation across dependent folds.
 
 # %%
 # UI LOGIC: Review becomes available after the explicit form action completes.
@@ -178,7 +188,8 @@ if controller.run is not None:
 # ## Explicit final test
 #
 # Leave the switch False until validation is reviewed. Test uses the same
-# Train-fitted Base and the frozen selected candidate, without historical refitting.
+# Train-fitted Base and selected candidate in single-split mode. Walk forward
+# instead uses the two development refits made after pooled-validation selection.
 # The revised BASE15 and engine quote families form a new experiment; saved old
 # BASE14 gains are not comparable evidence. All results are computed from this run.
 

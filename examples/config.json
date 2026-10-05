@@ -57,5 +57,6 @@
     "target_mode": "level",
     "test_embargo_dates": 1
   },
-  "base_cat_features": []
+  "base_cat_features": [],
+  "walk_forward": null
 }

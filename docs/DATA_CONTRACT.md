@@ -69,4 +69,18 @@ Set `PipelineConfig(priority_cpp_gap_column="your_gap_bps")` to supply the preco
 
 ## Ownership and interactive configuration
 
-`research_form` takes two prepared DataFrames, `BASE_FEATURES`, `BASE_CAT_FEATURES` and `LGB_PARAMS`. Configuration objects can prefill source mappings and research settings; the form remains editable. Validate performs structural preflight, and Run validation starts computation. Displaying the form does not train. Dataset-specific transformations, sector maps, proxy construction, baseline engineering and benchmark repairs stay in the user notebook or upstream pipeline; no dataset preset is installed.
+`research_form` takes two prepared DataFrames, `BASE_FEATURES`, `BASE_CAT_FEATURES` and `LGB_PARAMS`. Configuration objects can prefill source mappings and research settings; the form remains editable. Validate performs structural preflight and optional fold-date/label-release scans; Run validation starts feature/model computation. Displaying the form does not train. Dataset-specific transformations, sector maps, proxy construction, baseline engineering and benchmark repairs stay in the user notebook or upstream pipeline; no dataset preset is installed.
+
+## Optional walk-forward contract
+
+`WalkForwardConfig` counts observed local dates. Minimum training and complete validation blocks are positive; inner embargo is nonnegative. `step_dates` must be at least the validation-block length, so no record receives two out-of-fold validation predictions. A rolling `max_train_dates` must be at least the minimum; omission gives expanding history. `n_splits` selects the latest available complete folds by dates only.
+
+The raw engine reserves final Test through `TrainingConfig` or supplied outer split labels. Development ends at the last outer Validation timestamp and includes earlier embargo history. Walk-forward `holdout_dates` and `holdout_embargo_dates` must therefore both be zero. Missing prediction times reject the fold preview rather than silently dropping records. Preview counts describe input rows; fitting/scoring still apply finite-label and prediction support checks.
+
+Each fold fits fresh models and Train-only categorical vocabularies. The pooled Validation table contains `cv_fold`; selection scores pooled records, not unweighted averages of fold losses. After selection, Base and the chosen candidate refit on development history, capped by `max_train_dates` if supplied. User-prepared BASE features must still be causal; the engine does not recompute arbitrary upstream rolling statistics or fit preprocessing on the user's behalf.
+
+Optional `label_available_column` is an upstream label-release timestamp, not the outcome itself. This eligibility field cannot be a BASE feature. Fold Train excludes unknown release times and times at/after validation-start local midnight. Development refits apply the same availability rule at the final-Test origin. Preview fold counts include the resulting purges. Without this field, timely labels are an explicit user assumption; an embargo alone cannot infer an unknown release delay.
+
+One shared LightGBM dictionary drives different feature counts. Feature-specific constraints, penalties, forced split/bin files and categorical/name overrides are rejected instead of being misaligned across families. Declare categoricals through `BASE_CAT_FEATURES`; independently constrained models belong in separate factories in `model_comparison_engine`.
+
+With label availability configured, candidate selection also excludes OOF outcomes unavailable before the final origin: first Test local midnight, or next local midnight after development when Test is absent. The saved `cv_label_available` flag, masked scoring level and `unavailable_validation_labels` manifest count disclose these exclusions while original target/source columns remain preserved.

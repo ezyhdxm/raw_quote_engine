@@ -102,6 +102,8 @@ def _comparison_section(output, label, comparison, index, config):
     from bond_pricer import Slice, default_slices
     declared = diagnostic_view(comparison.data, config, preserve_priority_sources=False)
     slices = default_slices(declared.columns)
+    if 'cv_fold' in comparison.data:
+        slices.append(Slice('cv_fold', top_n=100, name='Walk-forward fold'))
     maturity = next((name for name in ['MATURITY_YEARS', 'YRS_TO_MATURITY'] if name in declared), None)
     if maturity and not any(item.column == maturity for item in slices):
         slices.append(Slice(maturity, [-np.inf, 0, .25, 1, 3, 5, 10, np.inf], name='Remaining maturity'))
@@ -149,6 +151,7 @@ def _decision(metadata):
             ('Effective validation population', selection.get('effective_slice', 'Not recorded')),
             ('Support fallback used', selection.get('support_fallback', 'Not recorded')),
             ('Validation rows used', selection.get('rows', 'Not recorded')),
+            ('OOF labels unavailable before selection', selection.get('unavailable_validation_labels', 'Not configured')),
             ('Validation MAE improvement (%)', selection.get('improvement_pct', 'Not recorded')),
             ('Declared practical threshold (%)', selection.get('threshold_pct', 'Not recorded')),
             ('Practical threshold met', threshold_met if known else 'Unassessed'),
@@ -198,6 +201,13 @@ def write_report(out, tables, comparisons=None, metadata=None):
     intro += '<p>Every numerical table and figure in this report is generated from this run\'s supplied data, computed diagnostics and comparison objects.</p>'
     intro += '<p>Read coverage first, then event ambiguity, pair/age conditions, fixed cases and model comparisons. All-target coverage and paired-model accuracy answer different questions.</p>'
     intro += _decision(metadata) + _test_summary(comparisons, metadata.get('selection', {}).get('selected'))
+    if metadata.get('walk_forward') is not None:
+        intro += '<section><h2>Walk-forward validation</h2><p>Validation comparisons pool nonoverlapping out-of-fold predictions. '
+        intro += 'Each fold fits fresh estimators and category vocabularies using earlier training records. Prior validation records may enter a later training window. '
+        intro += 'The final Test and its outer buffer are excluded from every fold. After selection, only Base and the frozen candidate are refitted on eligible development history.</p>'
+        intro += '<p>Selection uses record-weighted pooled loss; fold win rates and worst-fold gains are descriptive stability checks, not confidence intervals. '
+        intro += 'Configured label-availability times purge unavailable labels; without them, the caller must establish that training labels are already known.</p>'
+        intro += '<pre>'+escape(json.dumps(metadata['walk_forward'], indent=2))+'</pre></section>'
     # REPORTING LOGIC: Unit and timing contracts are explicit; interpretation cannot be inferred from column names.
     contract = {name: config.get(name, 'not supplied') for name in ['value_kind', 'unit', 'quote_scale', 'target_scale',
                 'error_scale', 'quantity_scale', 'quote_quantity_scale', 'timezone', 'quote_timezone', 'allow_exact', 'age_min', 'sync_min', 'lookback_min', 'case_seed']}

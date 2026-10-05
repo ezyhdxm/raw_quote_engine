@@ -6,13 +6,15 @@ import numpy as np
 import pandas as pd
 
 
-def read_data(source):
+def read_data(source, *, string_columns=None):
     # FILE IO LOGIC: Accept an in-memory table or a local CSV/Parquet file; never deserialize models.
     if isinstance(source, pd.DataFrame):
         return source.copy()
     path = Path(source)
     if path.suffix.lower() == '.csv':
-        return pd.read_csv(path)
+        # FILE IO LOGIC: Preserve declared identities; notebook loading can preserve every CSV column.
+        dtype = 'string' if string_columns == 'all' else {name: 'string' for name in string_columns or [] if name is not None}
+        return pd.read_csv(path, dtype=dtype)
     if path.suffix.lower() in {'.parquet', '.parque', '.pq'}:
         return pd.read_parquet(path)
     raise ValueError('Use a pandas DataFrame, CSV or Parquet file.')
@@ -27,7 +29,7 @@ def check_key(frame, column):
 def attach_predictions(data, predictions, *, on, columns=None):
     """Left-join a wide prediction table by identity; missing predictions remain visible."""
     # FILE IO LOGIC: Materialize independent input tables.
-    left, right = read_data(data), read_data(predictions)
+    left, right = read_data(data, string_columns=[on]), read_data(predictions, string_columns=[on])
     check_key(left, on)
     check_key(right, on)
     columns = columns or {name: name for name in right if name != on}
@@ -51,7 +53,7 @@ def from_long_predictions(data, predictions, *, on='row_id', model='model', valu
                           stage_column='stage', stage=None):
     """Convert saved model/row predictions to wide columns without opening other stages."""
     # FILE IO LOGIC: Read only the explicit table supplied by the caller.
-    predictions = read_data(predictions)
+    predictions = read_data(predictions, string_columns=[on, model, stage_column])
     # VALIDATION LOGIC: Multiple stages require an explicit choice; never silently blend holdouts.
     required = {on, model, value}
     if not required.issubset(predictions):
@@ -80,7 +82,12 @@ def numeric(frame, column):
     # VALIDATION LOGIC: Coerce only the specified numerical field; retain the source table.
     if column not in frame:
         raise ValueError(f'Missing column: {column!r}')
-    return pd.to_numeric(frame[column], errors='coerce').replace([np.inf, -np.inf], np.nan)
+    # CORE LOGIC: STEP 1 — Promote declared numeric values before subtraction or anchor addition.
+    # Input: values=[1,'bad',None,inf].
+    # Output: float64 values=[1.0,NaN,NaN,NaN], retaining the original index.
+    # Explanation: Invalid or nonfinite inputs become missing; finite inputs keep their numeric magnitude.
+    # Trick: Float64 arithmetic prevents int64 wrap and float32 overflow; very large integers use float64 precision.
+    return pd.to_numeric(frame[column], errors='coerce').replace([np.inf, -np.inf], np.nan).astype('float64')
 
 
 def local_time(values, timezone):
@@ -106,7 +113,7 @@ def paired_rows(data, actual, reference, candidate, *, id_column=None, time_colu
                 reference_anchor=None, candidate_anchor=None):
     """Keep the common finite sample, recording every exclusion and side's own coverage."""
     # VALIDATION LOGIC: Error units and identity are explicit, never inferred from observed errors.
-    frame = data if isinstance(data,pd.DataFrame) else read_data(data)
+    frame = data if isinstance(data,pd.DataFrame) else read_data(data, string_columns=[id_column, bond_column])
     if frame.columns.duplicated().any() or any(str(c).startswith('__') for c in frame):
         raise ValueError('Input columns must be unique; names starting with __ are reserved.')
     if not np.isfinite(error_scale) or error_scale <= 0:

@@ -26,7 +26,7 @@ controller = research_form(
 
 Map the transaction bond ID, prediction time and target; map the quote bond ID, known time, dealer, side/value or bid/ask values. Optional mappings include actual scoring spread, prediction anchor, rollover adjustment, proxy, quantity, issuer, sector, maturity and an explicit split. A configured optional field must exist. Leave its mapping unset when unavailable.
 
-Review the ordered baseline list, its categorical subset, LightGBM parameters, source timezones, scales, date policy and output location. **Validate inputs** performs preflight without training. **Run validation** starts Steps 1–5 after valid settings are accepted. Progress identifies stages and completed work units. `controller.run` is `None` before completion and holds the resulting `ResearchRun` afterward. Notebook Run All only displays the form.
+Review the ordered baseline list, its categorical subset, LightGBM parameters, source timezones, scales, date policy and output location. **Validate inputs** performs preflight without training; optional walk-forward mode also scans transaction times/split labels to preview folds. **Run validation** starts Steps 1–5 after valid settings are accepted. Progress identifies stages and completed work units. `controller.run` is `None` before completion and holds the resulting `ResearchRun` afterward. Notebook Run All only displays the form.
 
 Supply `config=PipelineConfig(...)` and `training=TrainingConfig(...)` to prefill the form. Optionally supply `quote_universe=pd.DataFrame({'cusip': ...})` when the full research universe is wider than eligible modeling transactions. `cache_dir` can place reusable caches in another local folder.
 
@@ -58,9 +58,44 @@ Default fractions reserve 20% of observed dates for Validation and 20% for Test,
 
 For the short BondCliQ example: `validation_dates=5`, `test_dates=5`, `embargo_dates=2`, `test_embargo_dates=0`, `min_train_dates=10`. On 22 observed weekdays from March 2–31, 2026, Train is March 2–13, embargo March 16–17, Validation March 18–24 and Test March 25–31.
 
-Four families share training rows and parameters: Base, Quote, Quote+Path and Quote+CrossBond. The last adds same-bond matched-dealer and other-bond issuer movements. There is no parameter search or test-dependent early stopping. Transactions without quotes remain. Category vocabularies are learned on Train only; the categorical subset is explicitly supplied.
+Four families share training rows and parameters: Base, Quote, Quote+Path and Quote+CrossBond. The last adds same-bond matched-dealer movements and, when an issuer mapping is supplied, other-bond issuer movements. Without that mapping, the compatibility label `Quote+CrossBond` contains same-bond movement only; the family name is not evidence of available cross-bond support. There is no parameter search or test-dependent early stopping. Transactions without quotes remain. Category vocabularies are learned on Train only; the categorical subset is explicitly supplied.
 
 Selection uses the lowest validation MAE among quote candidates on the declared cohort, with a support-based fallback recorded in `selection.json`. The five-input form defaults to All records. The BondCliQ example selects quantity >=1MM and maturity >1 year; choose this cohort explicitly in the generic form when appropriate. Short maturity and unknown metadata remain separate diagnoses. The 5% practical threshold is not a significance test; overlapping exploratory slices are not independent evidence.
+
+## Optional walk-forward validation
+
+Keep **Single split** for the existing workflow, or select **Walk forward** in the form. Configure inner fold sizes separately from the outer Test reservation. Click **Validate inputs** before Run: the form displays every fold's train/validation date boundaries, observed date counts and supplied row counts, plus the total fit budget. This date scan reads prediction times, outer split labels and optional label-release timestamps; it reads no target values, builds no quote features and fits no model. Changed fold dates/settings require reviewing a new preview before work starts.
+
+```python
+# SETUP LOGIC: The same policy object supports the form and programmatic pipeline.
+from raw_quote_engine import WalkForwardConfig, research_form
+# CONFIGURATION LOGIC: Expand from 20 observed dates, validate 5 dates, and embargo 2 before each fold.
+walk_forward = WalkForwardConfig(
+    min_train_dates=20, validation_dates=5, embargo_dates=2,
+    step_dates=5, max_train_dates=None, n_splits=4,
+)
+# UI LOGIC: The form previews the latest available complete folds; training remains an explicit click.
+controller = research_form(
+    transactions_df, quotes_df, BASE_FEATURES, BASE_CAT_FEATURES, LGB_PARAMS,
+    config=config, training=training, walk_forward=walk_forward, output='runs/walk_forward',
+)
+```
+
+`n_splits` limits the plan to the latest complete folds using dates alone. `step_dates=None` defaults to the validation-block size; a larger step leaves intentional unscored gaps. Steps smaller than the validation block reject because validation rows may not overlap. `max_train_dates=None` expands training from the earliest eligible date; a positive cap creates a rolling training window and must be at least `min_train_dates`. Incomplete final blocks are not scored. Counts use observed local dates, not calendar subtraction.
+
+The engine first assigns the existing outer Train/Validation/Test split. Development includes every row up to the last outer Validation timestamp, including earlier outer embargo rows. The final Test embargo and Test rows remain excluded from all folds and development refits. Do not set inner `holdout_dates` or `holdout_embargo_dates`: the raw engine requires both to be zero because the outer split owns that reservation.
+
+Optional `label_available_column` names an upstream timestamp for when each training label became known. Labels with missing release time or release at/after the fold's validation-start local midnight are excluded from that fold's training records; the preview reports those purged counts. The same contract applies to development refits before final Test. The release-time column is an eligibility field and cannot be a BASE feature. Before candidate selection, out-of-fold outcomes still unavailable at the final origin are masked from scoring: the first Test date's local midnight, or the next local midnight after development when no Test exists. Saved `cv_label_available` flags and the manifest's `unavailable_validation_labels` count expose this exclusion; original supplied target/source fields remain available for provenance. Without this column, label availability at the origin is a caller assumption, and an embargo may be needed for the label horizon.
+
+Every fold independently fits the four declared model families, with categories learned only on that fold's training rows. Predictions are pooled into a common-record out-of-fold Validation table with `cv_fold`. Candidate selection uses those pooled records, weighted by record count rather than averaging fold means. After freezing the winner, only Base and that candidate are refitted on development history; a configured rolling cap also limits those refits. Final Test remains an explicit later action. Total cost is **4 × folds + 2 fits**; event aggregation and time-causal quote features run once.
+
+Use `run.review(stage='Validation')` to compare pooled out-of-fold predictions and choose `cv_fold` as a custom slice. Computed tables `cv_folds`, `cv_metrics` and `cv_stability` document date support, per-fold results and variation. The generated report carries this evidence. No confidence interval or significance claim follows automatically from a handful of folds. Overlapping training windows and correlated securities mean folds are not independent experiments.
+
+The engine controls model-fitting boundaries, but cannot repair a user feature engineered with future data. Prepare baseline rolling features, imputations and benchmark inputs causally; any learned transformation must respect fold training boundaries. Quote feature reuse is valid only because quote calculations themselves obey known-time boundaries and do not use future labels.
+
+Feature-specific LightGBM constraints cannot be shared blindly across augmented feature families. The raw engine rejects per-feature monotonicity/interaction vectors, feature penalties and forced split/bin files; use `BASE_CAT_FEATURES` for categories. To train models with independently defined feature constraints or preprocessing, use separate model factories in the standalone `model_comparison_engine` walk-forward interface.
+
+For batch runs, pass `walk_forward=walk_forward` to `run_research`. In CLI JSON, set a top-level `walk_forward` object with the same fields; `null` or omission selects Single split. The example config keeps this option off.
 
 ## 5. Programmatic and CLI use
 
@@ -110,7 +145,7 @@ After accepting the frozen validation choice, explicitly call `run.finalize_test
 python -m raw_quote_engine.cli final-test examples/runs/my_research
 ```
 
-Only Base and the selected candidate are evaluated, using the same Train-fitted models. No final refit is performed. Repeat calls reuse saved predictions. Prior external exposure of those dates remains a limitation; the engine cannot restore unseen status.
+Only Base and the selected candidate are evaluated. Single-split runs reuse the Train-fitted models. Walk-forward runs use the two development refits completed after the pooled-validation choice; final test starts no additional fit. Repeat calls reuse saved predictions. Prior external exposure of those dates remains a limitation; the engine cannot restore unseen status.
 
 Outputs include `report.html`, full tables/figures, `features.parquet`, validation predictions, model files and schemas, `selection.json` and a manifest of configuration, versions, fingerprints and evaluation state. Explicit finalization adds test predictions and test evidence. Source inputs and generated artifacts stay local.
 

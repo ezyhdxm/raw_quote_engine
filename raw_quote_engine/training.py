@@ -190,7 +190,24 @@ def variants(base_features, groups):
     return result
 
 
+def validate_model_parameters(params):
+    # VALIDATION LOGIC: All variants share scalar settings but have different feature counts and internal names.
+    params = params or {}
+    unsupported = {'categorical_feature', 'categorical_column', 'cat_feature', 'cat_column', 'feature_name',
+        'monotone_constraints', 'monotonic_cst', 'monotone_constraint', 'mc', 'interaction_constraints',
+        'feature_contri', 'feature_contrib', 'feature_contribs', 'feature_contributions', 'feature_penalty',
+        'cegb_penalty_feature_lazy', 'cegb_penalty_feature_coupled', 'forcedsplits_filename',
+        'forced_splits_filename', 'forcedbins_filename'}
+    provided = sorted(name for name in unsupported if params.get(name) is not None)
+    if provided:
+        raise ValueError(f'Feature-specific LGB_PARAMS are not shared across augmented variants: {provided}. '
+            'Use BASE_CAT_FEATURES for categories. For separate feature constraints, use independent '
+            'model factories in model_comparison_engine instead of the fixed raw-engine families.')
+
+
 def fit_models(frame, definitions, params, settings, progress, base_cat_features=None):
+    # VALIDATION LOGIC: Direct callers receive the same actionable parameter checks as the notebook pipeline.
+    validate_model_parameters(params)
     # CORE LOGIC: STEP 1 — Fit every candidate on exactly the same finite-label training rows.
     # Input: stages=['Train','Train','Validation'], target=[1,NaN,5].
     # Output: training row positions=[0]; validation target5 is never passed to fit.
