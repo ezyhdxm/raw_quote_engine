@@ -6,6 +6,8 @@ It is adapted from a BondCliQ research project, but requires no BondCliQ files, 
 
 ## Start here
 
+**Using the existing BondCliQ files and `data_ig`?** Open [bondcliq_research.ipynb](bondcliq_research.ipynb), change its two input paths, and follow the [BondCliQ example](docs/BONDCLIQ_EXAMPLE.md). Its preset supplies the original BASE14 list, LightGBM parameters, source mappings and pilot dates; the guide distinguishes the engine's new quote experiments from the historical notebook.
+
 ```bash
 python -m pip install -e ".[notebook]"
 python -m raw_quote_engine.cli demo --output runs/synthetic_demo

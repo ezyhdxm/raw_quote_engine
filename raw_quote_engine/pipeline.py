@@ -59,7 +59,7 @@ class ResearchRun:
 
 
 def run_research(transactions, quotes, base_features, model_params, config, *, output='runs/research',
-                 training=None, evaluate_test=False, cache_dir=None, progress=None):
+                 training=None, evaluate_test=False, cache_dir=None, progress=None, quote_universe=None):
     """Run Steps 1–5. Existing completed stages resume only when data and settings match."""
     # CONFIGURATION LOGIC: Keep the four essential inputs explicit, accepting dataclass or JSON-style mappings.
     config = config if isinstance(config, PipelineConfig) else PipelineConfig.from_dict(config)
@@ -74,7 +74,7 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
     # INGESTION LOGIC: Source files are read once; users retain their original DataFrames unchanged.
     notify('step1', None, None, 'Normalizing supplied transactions and known-time raw quotes')
     tx, tx_audit = normalize_transactions(transactions, config)
-    raw, quote_audit = normalize_quotes(quotes, config, tx)
+    raw, quote_audit = normalize_quotes(quotes, config, tx if quote_universe is None else quote_universe)
     validate_features(tx, base_features, config, training)
     tx = assign_splits(tx, training)
     # CACHEING LOGIC: Numerical code, full-precision input contents and explicit settings identify this run.
@@ -104,7 +104,8 @@ def run_research(transactions, quotes, base_features, model_params, config, *, o
     definitions = variants(base_features, feature_meta['groups'])
     # MODELING LOGIC: Training cache reuse avoids repeated fitting when a user only needs another slice/report.
     models = cache.get('step5_models', model_key, lambda: fit_models(frame, definitions, model_params, training, notify))
-    validation = cache.get('step5_validation', model_key, lambda: predict_stage(frame, models, 'Validation', training))
+    actual_column = 'actual' if config.transactions.actual is not None else None
+    validation = cache.get('step5_validation', model_key, lambda: predict_stage(frame, models, 'Validation', training, actual_column))
     selected = select_candidate(validation, config, training)
     # FILE IO LOGIC: Commit the validation decision before any test predictions or test loss calculations.
     metadata.update(selection=selected, feature_groups=feature_meta['groups'], status='validation_complete',
@@ -131,8 +132,8 @@ def validate_features(tx, base_features, config, training):
         raise ValueError('At least one valid transaction is required.')
     if not base_features or len(set(base_features)) != len(base_features) or set(base_features)-set(tx):
         raise ValueError('Provide a nonempty, unique list of existing base feature columns.')
-    if config.transactions.target in base_features:
-        raise ValueError('The target source column cannot be a base feature.')
+    if set(base_features) & {config.transactions.target, config.transactions.actual, 'target', 'actual'}:
+        raise ValueError('Target and actual outcome columns cannot be base features.')
     reserved = [c for c in tx if c.startswith(('bcq_', 'prediction_', '__')) or c in {'actual_level', 'prior_trade_count_30d', 'history_days_available', 'history_30d_complete'}]
     if reserved:
         raise ValueError(f'Rename source columns reserved for generated research outputs: {reserved}')
@@ -143,7 +144,7 @@ def validate_features(tx, base_features, config, training):
 def manifest(config, training, key, feature_key, params, base, tx_audit, quote_audit):
     # PROVENANCE LOGIC: Record the input audit and exact libraries, not a claim of generalization.
     versions = {name: version(name) for name in ('pandas', 'numpy', 'lightgbm', 'matplotlib')}
-    return dict(engine_version='0.1.0', run_key=key, feature_key=feature_key, synthetic=config.synthetic,
+    return dict(engine_version='0.1.1', run_key=key, feature_key=feature_key, synthetic=config.synthetic,
                 config=config.to_dict(), training=training.to_dict(), base_features=list(base), model_params=params,
                 dependencies=versions, normalization={'transactions': tx_audit, 'quotes': quote_audit},
                 test_status='not evaluated', test_exposure_history='unknown; caller must disclose prior use',
@@ -250,7 +251,8 @@ def finalize_test(output, progress=None):
         raise ValueError('Model artifacts belong to a different run.')
     models = {name: saved['models'][name] for name in ('Base', frozen['selected'])}
     notify('test', None, None, f'Evaluating frozen {frozen["selected"]} versus Base')
-    predictions = predict_stage(run.features, models, 'Test', settings)
+    actual_column = 'actual' if config.transactions.actual is not None else None
+    predictions = predict_stage(run.features, models, 'Test', settings, actual_column)
     # FILE IO LOGIC: Save one fixed test comparison and clearly mark that test is now exposed.
     temporary = run.output/'predictions_test.parquet.tmp'
     predictions.to_parquet(temporary, index=False)

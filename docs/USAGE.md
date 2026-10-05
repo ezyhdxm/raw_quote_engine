@@ -1,5 +1,7 @@
 # Reproducing a report from raw data
 
+For the existing BondCliQ/data_ig setup, use the [ready BondCliQ example](BONDCLIQ_EXAMPLE.md) and [its notebook](../bondcliq_research.ipynb). Only the two input paths are required; the preset supplies the original baseline and LightGBM settings. The generic mapping workflow below is for other datasets or intentionally different experiments.
+
 ## 1. Install
 
 Download this repository as ZIP or clone it. Open a terminal in the extracted directory and run `python -m pip install -e ".[notebook]"`. Python 3.10+ is required. A separate virtual environment is recommended. On systems where LightGBM requires an OpenMP runtime, use a working LightGBM installation before starting a long run.

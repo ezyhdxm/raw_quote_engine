@@ -21,6 +21,7 @@ class TransactionColumns:
     anchor: str = None
     cpp: str = None
     split: str = None
+    actual: str = None
 
     def __post_init__(self):
         # VALIDATION LOGIC: Required mappings must be nonempty column names, not positional indices.
@@ -67,7 +68,7 @@ def _column_names(schema, required):
 class PipelineConfig:
     """Normalize target/anchor/cpp and quotes into compatible units before comparing them.
 
-    target_scale multiplies target, anchor, and cpp; quote_scale multiplies quote values.
+    target_scale multiplies target, actual, anchor, and cpp; quote_scale multiplies quote values.
     error_scale subsequently converts prediction errors into unit. Price values remain
     prices: their canonical storage field is named spread only for event-engine compatibility.
     quantity_scale applies to transaction sizes; quote_quantity_scale independently
@@ -92,6 +93,8 @@ class PipelineConfig:
     target_scale: float = 1.0
     selection_min_count: int = 30
     synthetic: bool = False
+    priority_history_column: str = None
+    priority_cpp_gap_column: str = None
 
     def __post_init__(self):
         # VALIDATION LOGIC: Reject ambiguous units and impossible feature settings before ingesting data.
@@ -105,6 +108,10 @@ class PipelineConfig:
             raise ValueError('unit must be a nonempty displayed error-unit name.')
         if not isinstance(self.timezone, str) or not self.timezone.strip():
             raise ValueError('timezone must be a named timezone.')
+        if self.priority_history_column is not None and (not isinstance(self.priority_history_column, str) or not self.priority_history_column.strip()):
+            raise ValueError('priority_history_column must be a nonempty column name or None.')
+        if self.priority_cpp_gap_column is not None and (not isinstance(self.priority_cpp_gap_column, str) or not self.priority_cpp_gap_column.strip()):
+            raise ValueError('priority_cpp_gap_column must be a nonempty column name or None.')
         for name in ['error_scale', 'quantity_scale', 'quote_quantity_scale', 'quote_scale', 'target_scale', 'clip_floor', 'age_min']:
             if not isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive and finite.')

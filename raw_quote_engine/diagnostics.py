@@ -199,7 +199,9 @@ def priority_groups(targets, config):
     """Return declared masks and required columns, independent of predictions and gains."""
     # CONFIGURATION LOGIC: Fixed diagnostic slices are independent of model gains and include availability notes.
     maturity = next((c for c in ['MATURITY_YEARS', 'YRS_TO_MATURITY'] if c in targets), None)
-    history = next((c for c in ['prior_trade_count_30d', 'TRADE_COUNTS_PREV_MONTH', 'prior_count'] if c in targets), None)
+    history = config.get('priority_history_column')
+    if history is None:
+        history = next((c for c in ['prior_trade_count_30d', 'TRADE_COUNTS_PREV_MONTH', 'prior_count'] if c in targets), None)
     size, term, count = numeric(targets, 'QUANTITY'), numeric(targets, maturity), numeric(targets, history)
     # CORE LOGIC: STEP 1 — Form large, long-maturity and sparse-history masks without imputing unknowns.
     # Input: quantity=[1e6,2e6,2e6],term=[2,.1,NaN],count=[0,14,NaN].
@@ -213,16 +215,20 @@ def priority_groups(targets, config):
               ('>=1MM & maturity>1y', large & long, ['QUANTITY', maturity]),
               ('Prior count 0-14', sparse, [history]), ('>=1MM & prior count 0-14', large & sparse, ['QUANTITY', history]),
               ('>=1MM & prior count 0-14 & maturity>1y', large & sparse & long, ['QUANTITY', history, maturity])]
-    # CONFIGURATION LOGIC: CPP groups are available only with explicit canonical levels and a spread unit contract.
+    # CONFIGURATION LOGIC: Choose declared discrepancy or canonical levels; both require a spread/bps contract.
     spread = config.get('value_kind', 'spread') == 'spread' and config.get('unit', 'bps') == 'bps'
-    cpp_fields = ['cpp', 'anchor']
+    gap_column = config.get('priority_cpp_gap_column')
+    cpp_fields = [gap_column] if gap_column is not None else ['cpp', 'anchor']
     cpp_available = spread and all(c in targets for c in cpp_fields)
     # CORE LOGIC: STEP 2 — Apply declared spread-scale discrepancy thresholds without calling the anchor bad.
-    # Input: cpp=[106,110,111],anchor=[100,100,100],error_scale=1; quantities all 2MM.
-    # Output: discrepancy=[6,10,11] bps; strict >10 selects only the last value.
-    # Explanation: Compare same-unit supplied CPP and anchor levels; do not substitute a side-dependent upstream field.
-    # Trick: No unseen roll offset is inferred; the report identifies this exact canonical-level definition.
-    gap = (numeric(targets, 'cpp') - numeric(targets, 'anchor')).abs() * config.get('error_scale', 1)
+    # Input: priority_cpp_gap_column='gap_bps', gap_bps=[5,10,10.01,NaN], quantities all 2MM, error_scale=100.
+    # Output: >5 selects [False,True,True,False]; >10 selects [False,False,True,False].
+    # Explanation: Explicit discrepancies are already bps; otherwise abs(cpp-anchor)*error_scale is used.
+    # Trick: No re-scaling, anchor reconstruction or row fallback changes explicit gap values or exact boundaries.
+    if gap_column is None:
+        gap = (numeric(targets, 'cpp') - numeric(targets, 'anchor')).abs() * config.get('error_scale', 1)
+    else:
+        gap = numeric(targets, gap_column).abs()
     for cutoff in [5, 10]:
         selected = large & gap.gt(cutoff) if cpp_available else pd.Series(False, index=targets.index)
         groups.extend([(f'>=1MM & CPP gap>{cutoff}bps', selected, ['QUANTITY', *cpp_fields]),

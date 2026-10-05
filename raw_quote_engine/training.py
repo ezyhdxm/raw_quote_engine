@@ -19,6 +19,8 @@ class TrainingConfig:
     min_selection_rows: int = 30
     useful_improvement_pct: float = 5.0
     seed: int = 2026
+    category_order: str = 'sorted'
+    apply_model_defaults: bool = True
 
     def __post_init__(self):
         # VALIDATION LOGIC: Fail before expensive feature calculation on impossible experiment settings.
@@ -38,6 +40,10 @@ class TrainingConfig:
             raise ValueError('target_mode must be level or delta (requires prediction-time anchor).')
         if self.selection_slice not in {'large_long', 'large', 'all'}:
             raise ValueError('selection_slice must be large_long, large or all.')
+        if self.category_order not in {'sorted', 'appearance'}:
+            raise ValueError('category_order must be sorted or appearance.')
+        if not isinstance(self.apply_model_defaults, bool):
+            raise ValueError('apply_model_defaults must be a boolean.')
 
     def to_dict(self):
         # SERIALIZATION LOGIC: Freeze the entire experiment definition in the report manifest.
@@ -98,16 +104,28 @@ def automatic_splits(frame, settings):
     return frame.assign(split=labels)
 
 
-def prepare_schema(train, columns):
+def category_values(values, order):
+    # CORE LOGIC: STEP 1 — Freeze a category vocabulary in the declared training-only order.
+    # Input: values=['Z','A',None,'Z'], order='appearance'.
+    # Output: ['Z','A']; order='sorted' produces ['A','Z'] for the same input.
+    # Explanation: Drop missing values, stringify observed labels and remove repeated labels before ordering.
+    # Trick: unique preserves first occurrence; string conversion matches the later encoding contract.
+    categories = values.dropna().astype(str).unique().tolist()
+    return sorted(categories) if order == 'sorted' else categories
+
+
+def prepare_schema(train, columns, category_order='sorted'):
     # VALIDATION LOGIC: Explicit features cannot directly contain the target or generated predictions/stages.
     if not columns or len(set(columns)) != len(columns) or any(c not in train for c in columns):
         raise ValueError('Base/model features must be a nonempty, unique list of existing columns.')
-    if set(columns) & {'target', 'split', 'row_id', 'time', 'actual_level'}:
+    if set(columns) & {'target', 'actual', 'split', 'row_id', 'time', 'actual_level'}:
         raise ValueError('Target, identity, time and split columns cannot be model features.')
+    if category_order not in {'sorted', 'appearance'}:
+        raise ValueError('category_order must be sorted or appearance.')
     # CORE LOGIC: STEP 1 — Learn categorical vocabularies using training rows only.
-    # Input: train sector=['Energy','Bank',None]; validation includes a new 'TMT'.
-    # Output: schema sector={'kind':'category','categories':['Bank','Energy']}; TMT is not learned.
-    # Explanation: Sorted training categories define the model input representation.
+    # Input: train sector=['Energy','Bank',None,'Energy']; category_order='appearance'; validation has 'TMT'.
+    # Output: schema sector={'kind':'category','categories':['Energy','Bank']}; TMT is not learned.
+    # Explanation: First appearance preserves training category codes; default 'sorted' returns ['Bank','Energy'].
     # Trick: New categories later map to missing, rather than changing integer codes or reading test metadata.
     schema = {}
     for column in columns:
@@ -117,7 +135,7 @@ def prepare_schema(train, columns):
         if pd.api.types.is_numeric_dtype(values):
             schema[column] = {'kind': 'numeric'}
         else:
-            schema[column] = {'kind': 'category', 'categories': sorted(values.dropna().astype(str).unique().tolist())}
+            schema[column] = {'kind': 'category', 'categories': category_values(values, category_order)}
     return schema
 
 
@@ -127,14 +145,15 @@ def encode(frame, schema):
     # Input: x=[1,inf], sector=['Bank','TMT']; train categories=['Bank','Energy'].
     # Output: x=[1,NaN], sector categorical codes=[0,-1].
     # Explanation: Infinite numeric values and unseen categories become LightGBM missing inputs.
-    # Trick: Declared column order is preserved; categorical codes are never fit on validation/test.
-    result = pd.DataFrame(index=frame.index)
+    # Trick: Build columns together to avoid fragmented wide frames; input indices and category codes stay fixed.
+    values_by_column = {}
     for column, specification in schema.items():
         values = frame[column]
         if specification['kind'] == 'numeric':
-            result[column] = pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan).astype(float)
+            values_by_column[column] = pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan).astype(float)
         else:
-            result[column] = pd.Categorical(values.astype('string'), categories=specification['categories'])
+            values_by_column[column] = pd.Categorical(values.astype('string'), categories=specification['categories'])
+    result = pd.DataFrame(values_by_column, index=frame.index)
     # CORE LOGIC: STEP 2 — Use stable internal names so arbitrary user feature labels are accepted by LightGBM.
     # Input: ordered feature columns=['quote:level','size[USD]'].
     # Output: estimator input columns=['feature_0000','feature_0001']; values/order are unchanged.
@@ -169,11 +188,13 @@ def fit_models(frame, definitions, params, settings, progress):
     # MODELING LOGIC: Fixed user parameters; no early stopping, tuning or test-dependent model count.
     defaults = dict(n_estimators=200, learning_rate=.05, num_leaves=31, random_state=settings.seed,
                     n_jobs=-1, verbosity=-1, deterministic=True)
+    if not settings.apply_model_defaults:
+        defaults = {}
     defaults.update(params or {})
     models = {}
     for index, (name, columns) in enumerate(definitions.items()):
         progress('models', index, len(definitions), f'Fitting {name} on {len(train):,} training records')
-        schema = prepare_schema(train, columns)
+        schema = prepare_schema(train, columns, settings.category_order)
         estimator = LGBMRegressor(**defaults)
         estimator.fit(encode(train, schema), train.target)
         models[name] = {'estimator': estimator, 'schema': schema, 'features': columns}
@@ -181,16 +202,18 @@ def fit_models(frame, definitions, params, settings, progress):
     return models
 
 
-def predict_stage(frame, models, stage, settings):
+def predict_stage(frame, models, stage, settings, actual_column=None):
     # CORE LOGIC: STEP 1 — Select one declared evaluation stage, retaining invalid-label rows for coverage.
-    # Input: rows=(7,Validation,target1),(8,Test,target2),(9,Validation,targetNaN).
-    # Output: evaluation row_id=[7,9]; actual_level=[1,NaN] in level mode.
-    # Explanation: The model predicts every evaluation row; the paired comparison later audits invalid labels.
-    # Trick: No missing-quote or short-maturity mask changes the evaluation population.
+    # Input: rows=(7,Validation,target1,anchor10,actual12),(8,Test,2,10,12),(9,Validation,NaN,10,NaN), delta mode, actual_column='actual'.
+    # Output: evaluation row_id=[7,9]; actual_level=[12,NaN], not inferred [11,NaN].
+    # Explanation: Explicit realized outcomes take precedence even when the fitted delta includes an adjustment.
+    # Trick: With no actual mapping, the original target (level) or target+anchor (delta) convention applies.
     output = frame.loc[frame.split.eq(stage)].copy()
     output['actual_level'] = output.target
     if settings.target_mode == 'delta':
         output['actual_level'] = output.target+output.anchor
+    if actual_column is not None:
+        output['actual_level'] = output[actual_column]
     # INFERENCE LOGIC: Estimators only see their training-defined ordered features.
     for name, model in models.items():
         output['prediction_'+name] = model['estimator'].predict(encode(output, model['schema']))

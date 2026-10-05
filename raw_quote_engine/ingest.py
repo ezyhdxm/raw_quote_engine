@@ -114,7 +114,8 @@ def _transaction_mappings(columns):
     mappings = {'row_id': columns.id, 'cusip': columns.bond, 'time': columns.time, 'target': columns.target}
     optional = {'ISSUER': columns.issuer, 'SECTOR': columns.sector, 'QUANTITY': columns.quantity,
                 'PREV_QUANTITY': columns.prev_quantity, 'MATURITY_YEARS': columns.maturity_years,
-                'MATURITY_DATE': columns.maturity_date, 'anchor': columns.anchor, 'cpp': columns.cpp, 'split': columns.split}
+                'MATURITY_DATE': columns.maturity_date, 'anchor': columns.anchor, 'cpp': columns.cpp,
+                'actual': columns.actual, 'split': columns.split}
     mappings.update({name: source for name, source in optional.items() if source is not None})
     if columns.maturity_date is not None and columns.maturity_years is None:
         mappings['MATURITY_YEARS'] = None
@@ -158,16 +159,16 @@ def normalize_transactions(data, config):
     if invalid_keys.any() or frame['row_id'].duplicated().any():
         raise ValueError(f'Transactions need valid unique row IDs and nonmissing bond/time; invalid_key_rows={int(invalid_keys.sum())}, duplicate_id_rows={int(frame.row_id.duplicated().sum())}.')
     # CORE LOGIC: STEP 2 — Normalize labels and optional numerical inputs without changing the population.
-    # Input: target=[1.2,'bad',0], quantity=[1000,None,0], target_scale=100, quantity_scale=1000.
-    # Output: target=[120,NaN,0], QUANTITY=[1000000,NaN,0]; all three trades remain.
+    # Input: target=[1.2,'bad',0], actual=[2,3,None], quantity=[1000,None,0], target_scale=100, quantity_scale=1000.
+    # Output: target=[120,NaN,0], actual=[200,300,NaN], QUANTITY=[1000000,NaN,0]; all three trades remain.
     # Explanation: A missing label prevents supervised fitting for that trade, not its use in time-causal metadata.
-    # Trick: The same target scale applies to anchor/cpp so differences stay in one declared value unit.
+    # Trick: The same target scale applies to actual/anchor/cpp; an explicit actual is never inferred from target.
     frame['target'] = _number(original[columns.target], config.target_scale)
     numeric = {'QUANTITY': columns.quantity, 'PREV_QUANTITY': columns.prev_quantity,
-               'anchor': columns.anchor, 'cpp': columns.cpp, 'MATURITY_YEARS': columns.maturity_years}
+               'actual': columns.actual, 'anchor': columns.anchor, 'cpp': columns.cpp, 'MATURITY_YEARS': columns.maturity_years}
     for destination, source in numeric.items():
         if source is not None:
-            scale = config.quantity_scale if 'QUANTITY' in destination else (config.target_scale if destination in {'anchor', 'cpp'} else 1.)
+            scale = config.quantity_scale if 'QUANTITY' in destination else (config.target_scale if destination in {'actual', 'anchor', 'cpp'} else 1.)
             frame[destination] = _number(original[source], scale)
     # CORE LOGIC: STEP 3 — Add declared grouping metadata and maturity without inventing missing groups.
     # Input: issuer=[' ACME ',None], sector=['TMT',''], no maturity mapping or split mapping.
@@ -261,7 +262,7 @@ def normalize_quotes(data, config, transactions):
     # REPORTING LOGIC: Separate original source counts from expanded side-row diagnostics.
     diagnostics = dict(input_rows=len(frame), expanded_rows=len(rows), output_rows=len(kept),
                        excluded_rows=len(rows)-len(kept), invalid_key_rows=int(invalid.sum()),
-                       outside_universe_rows=int(outside.sum()), source_duplicate_rows=int(frame.duplicated().sum()),
+                       outside_universe_rows=int(outside.sum()), universe_bonds=len(universe), source_duplicate_rows=int(frame.duplicated().sum()),
                        invalid_value_rows=int(kept.spread.isna().sum()),
                        unknown_quantity_rows=int((kept.quantity.isna() | kept.quantity.le(0)).sum()),
                        zero_value_rows=int(kept.spread.eq(0).sum()), negative_value_rows=int(kept.spread.lt(0).sum()),
