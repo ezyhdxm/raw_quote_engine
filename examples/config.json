@@ -1,0 +1,20 @@
+{
+  "transactions_path": "../data/transactions.parquet",
+  "quotes_path": "../data/quotes.parquet",
+  "output": "runs/my_research",
+  "base_features": ["PREV_BM_SPREAD", "QUANTITY", "YRS_TO_MATURITY"],
+  "model_params": {"n_estimators": 200, "num_leaves": 31, "learning_rate": 0.05, "n_jobs": 4},
+  "config": {
+    "transactions": {
+      "bond": "CUSIP", "time": "prediction_time", "target": "BM_SPREAD",
+      "quantity": "QUANTITY", "prev_quantity": "PREV_QUANTITY", "issuer": "ISSUER", "sector": "SECTOR",
+      "maturity_years": "YRS_TO_MATURITY", "anchor": "PREV_BM_SPREAD", "cpp": "CPP_SPREAD"
+    },
+    "quotes": {"bond": "cusip", "known_time": "known_time", "dealer": "dealer_id", "bid": "bid", "ask": "ask", "quantity": "size"},
+    "value_kind": "spread", "unit": "bps", "timezone": "America/New_York",
+    "target_scale": 1, "quote_scale": 1, "error_scale": 1,
+    "quantity_scale": 1, "quote_quantity_scale": 1,
+    "age_min": 30, "lookback_min": 30, "sync_min": 1, "allow_exact": true
+  },
+  "training": {"validation_fraction": 0.2, "test_fraction": 0.2, "embargo_dates": 1, "selection_slice": "large_long", "target_mode": "level"}
+}
