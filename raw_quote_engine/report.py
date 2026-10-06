@@ -9,14 +9,19 @@ import re
 import numpy as np
 import pandas as pd
 from .diagnostics import diagnostic_view, priority_groups, settings
+from bond_pricer.ui_style import REPORT_STYLE
 
 # CONFIGURATION LOGIC: Keep generated evidence and interpretation visibly separate.
-STYLE = '''body{max-width:1200px;margin:36px auto;padding:0 22px;font:16px/1.6 system-ui;color:#193844}
-h1,h2,h3{line-height:1.25}table{border-collapse:collapse;font-size:13px;width:100%}
-th,td{padding:7px;border:1px solid #d8e2e6;text-align:left}th{background:#edf4f5}
-.scroll{overflow:auto;max-height:550px}img{width:100%;height:auto}.note{padding:14px;background:#edf6f7;border-left:5px solid #1a8285}
-.warning{background:#fff2dd;border-color:#b77d24}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f6f7;padding:14px}
-section{margin:30px 0}a{color:#087482}small{color:#556c75}code{overflow-wrap:anywhere}'''
+STYLE = REPORT_STYLE + '''
+.analysis-report .plot-scroll{overflow-x:auto;max-width:100%;border:1px solid #e0e8ef;border-radius:10px;margin:16px 0;background:#fff}
+.analysis-report .plot-scroll img{width:100%;max-width:none;margin:0;height:auto}
+.analysis-report .figure-link{font-size:12px;margin-top:5px;color:#52697f}
+.analysis-report .note{padding:16px 18px;background:#edf6f8;border-left:4px solid #217d88;border-radius:7px;color:#29485d}
+.analysis-report .warning{background:#fff5e3;border-color:#b78125;color:#795413}
+.analysis-report pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f2f6fa;border:1px solid #dce5ee;border-radius:8px;padding:16px;font-size:12px}
+.analysis-report small{color:#52697f}.analysis-report section{scroll-margin-top:18px}
+@media print{.analysis-report .plot-scroll{overflow:visible}.analysis-report .plot-scroll img{min-width:0!important;max-width:100%}}
+'''
 DESCRIPTIONS = {
     'global_summary': 'Separate target, bond, canonical quote-side row and exact-event denominators. Outside-universe and invalid values are audited upstream as well.',
     'bond': 'Every supplied traded bond, including bonds without any quote record in the supplied file. This is file coverage, not prediction-time availability.',
@@ -65,7 +70,8 @@ def _table(table, limit=100):
     # FORMATTING LOGIC: Escape input labels and show a bounded preview; the CSV always contains every row.
     shown = table.head(limit)
     note = f'<p><small>Showing {len(shown):,} of {len(table):,} rows. Download the CSV for full precision and all groups.</small></p>'
-    return note + '<div class="scroll">' + shown.to_html(index=False, escape=True, float_format=lambda value: f'{value:,.6g}') + '</div>'
+    return note + '<div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable results table">' + shown.to_html(
+        index=False, escape=True, border=0, float_format=lambda value: f'{value:,.6g}') + '</div>'
 
 
 def _filename(index, label):
@@ -125,8 +131,9 @@ def _comparison_section(output, label, comparison, index, config):
     # REPORTING LOGIC: Label the supplied stage/run; neither label nor report order selects a candidate.
     summary = comparison.summary(config.get('selection_min_count', 30))
     location = detail.relative_to(output).as_posix()
-    section = f'<section><h3>{escape(str(label))}</h3><p>{escape(comparison.candidate_name)} versus {escape(comparison.reference_name)} · error unit: {escape(comparison.unit)}.</p>'
-    section += _table(summary) + f'<img src="{location}/overview.png" alt="Computed paired model comparison">'
+    section = f'<section id="comparison-{index}"><h3>{escape(str(label))}</h3><p>{escape(comparison.candidate_name)} versus {escape(comparison.reference_name)} · error unit: {escape(comparison.unit)}.</p>'
+    section += _table(summary) + f'<div class="plot-scroll" tabindex="0" role="region" aria-label="Scrollable paired comparison figure"><img src="{location}/overview.png" alt="Computed paired model comparison" style="min-width:1000px"></div>'
+    section += f'<p class="figure-link"><a href="{location}/overview.png">Open full-size figure</a> · Scroll horizontally to inspect the complete chart.</p>'
     section += '<h4>Fixed priority groups</h4><p>These overlapping slices are diagnostic; missing prerequisites remain unsupported. A 5% gain, if used, is a descriptive threshold rather than significance.</p>'
     section += _table(priority) + f'<p><a href="tables/{filename}">Exact priority metrics CSV</a> · <a href="{location}/report.html">Complete comparison, slices, date sensitivity and configuration</a></p></section>'
     return section, priority
@@ -136,7 +143,7 @@ def _decision(metadata):
     # REPORTING LOGIC: Surface the frozen validation decision and explicit evaluation status before diagnostics.
     selection = metadata.get('selection')
     if not selection:
-        return '<section><h2>Recorded decision</h2><p>No selection record was supplied. This report does not choose a model.</p></section>'
+        return '<section id="decision"><h2>Recorded decision</h2><p>No selection record was supplied. This report does not choose a model.</p></section>'
     # CORE LOGIC: STEP 1 — Evaluate the declared practical threshold from the recorded validation gain.
     # Input: improvement_pct=1.2,threshold_pct=5.
     # Output: practical_threshold_met=False.
@@ -160,7 +167,7 @@ def _decision(metadata):
             ('Test status', metadata.get('test_status', 'Not recorded')),
             ('Earlier Test exposure', metadata.get('test_exposure_history', 'Not recorded'))]
     table = pd.DataFrame(rows, columns=['Recorded item', 'Value'])
-    return '<section><h2>Frozen validation decision and Test status</h2>' + _table(table) + '<p>Threshold attainment is descriptive. Test comparisons below review the already chosen candidate; they do not select a replacement.</p></section>'
+    return '<section id="decision"><h2>Frozen validation decision and Test status</h2>' + _table(table) + '<p>Threshold attainment is descriptive. Test comparisons below review the already chosen candidate; they do not select a replacement.</p></section>'
 
 
 def _test_summary(comparisons, selected):
@@ -171,8 +178,8 @@ def _test_summary(comparisons, selected):
         if len(stages) == 1 and stages[0] == 'Test' and comparison.candidate_name == selected:
             pieces.append(comparison.summary().assign(comparison=str(label)))
     if not pieces:
-        return '<section><h2>Selected-candidate Test results</h2><p>No identifiable selected-candidate Test comparison was supplied. No Test number is inferred.</p></section>'
-    return '<section><h2>Selected-candidate Test results</h2><p>Computed directly from the supplied saved Test comparison, on paired rows.</p>' + _table(pd.concat(pieces, ignore_index=True)) + '</section>'
+        return '<section id="test-status"><h2>Selected-candidate Test results</h2><p>No identifiable selected-candidate Test comparison was supplied. No Test number is inferred.</p></section>'
+    return '<section id="test-status"><h2>Selected-candidate Test results</h2><p>Computed directly from the supplied saved Test comparison, on paired rows.</p>' + _table(pd.concat(pieces, ignore_index=True)) + '</section>'
 
 
 def write_report(out, tables, comparisons=None, metadata=None):
@@ -197,12 +204,17 @@ def write_report(out, tables, comparisons=None, metadata=None):
     source = 'SYNTHETIC DEMONSTRATION — not evidence of market performance' if synthetic else 'Supplied input run — inspect provenance and sample coverage'
     if synthetic is None:
         source = 'Input provenance unspecified — interpret only after verifying the supplied data'
-    intro = f'<h1>Raw quote research run</h1><p class="note warning">{escape(source)}</p>'
+    intro = '<header class="hero"><div class="eyebrow">Spread research review</div><h1>Raw quote research run</h1>'
+    intro += '<p>Coverage, quote quality and saved model comparisons from one recorded run.</p></header>'
+    navigation = [('decision','Recorded decision'),('test-status','Test status'),('diagnostics','Diagnostics'),
+                  ('comparisons','Model comparisons'),('limits','Interpretation'),('provenance','Provenance')]
+    intro += '<nav aria-label="Report sections">'+''.join(f'<a href="#{key}">{label}</a>' for key,label in navigation)+'</nav>'
+    intro += f'<p class="note warning">{escape(source)}</p>'
     intro += '<p>Every numerical table and figure in this report is generated from this run\'s supplied data, computed diagnostics and comparison objects.</p>'
     intro += '<p>Read coverage first, then event ambiguity, pair/age conditions, fixed cases and model comparisons. All-target coverage and paired-model accuracy answer different questions.</p>'
     intro += _decision(metadata) + _test_summary(comparisons, metadata.get('selection', {}).get('selected'))
     if metadata.get('walk_forward') is not None:
-        intro += '<section><h2>Walk-forward validation</h2><p>Validation comparisons pool nonoverlapping out-of-fold predictions. '
+        intro += '<section id="walk-forward"><h2>Walk-forward validation</h2><p>Validation comparisons pool nonoverlapping out-of-fold predictions. '
         intro += 'Each fold fits fresh estimators and category vocabularies using earlier training records. Prior validation records may enter a later training window. '
         intro += 'The final Test and its outer buffer are excluded from every fold. After selection, only Base and the frozen candidate are refitted on eligible development history.</p>'
         intro += '<p>Selection uses record-weighted pooled loss; fold win rates and worst-fold gains are descriptive stability checks, not confidence intervals. '
@@ -226,19 +238,20 @@ def write_report(out, tables, comparisons=None, metadata=None):
         filename = _filename(index, name)
         table.to_csv(output / 'tables' / filename, index=False)
         description = DESCRIPTIONS.get(name, 'Additional computed run table supplied by the pipeline.')
-        sections.append(f'<section><h2>{escape(str(name).replace("_", " ").title())}</h2><p>{escape(description)}</p>' + _table(table) +
+        sections.append(f'<section id="diagnostic-{index}"><h2>{escape(str(name).replace("_", " ").title())}</h2><p>{escape(description)}</p>' + _table(table) +
                         f'<p><a href="tables/{filename}">Download complete CSV</a></p></section>')
         manifest.append(dict(table=str(name), rows=len(table), columns=list(table.columns), file=f'tables/{filename}'))
     # REPORTING LOGIC: Comparison objects already contain predictions; reports do not fit, infer or choose a winner.
-    model_sections = ['<h2>Computed model comparisons</h2>']
+    model_sections = ['<section id="comparisons"><h2>Computed model comparisons</h2>']
     for index, (label, comparison) in enumerate(comparisons.items(), len(tables) + 1):
         section, priority = _comparison_section(output, label, comparison, index, config)
         model_sections.append(section)
     if not comparisons:
         model_sections.append('<p>No model comparisons were supplied. These diagnostics do not establish predictive gain.</p>')
+    model_sections.append('</section>')
     # FILE IO LOGIC: Save only an aggregate table manifest; local explanatory case CSVs are explicitly identified.
     (output / 'table_manifest.json').write_text(json.dumps(_portable(manifest), allow_nan=False, indent=2), encoding='utf-8')
-    limits = '''<section><h2>Interpretation limits</h2><ul>
+    limits = '''<section id="limits"><h2>Interpretation limits</h2><ul>
 <li>Known time controls availability. Original event timestamps do not justify using a record before receipt; exact-time inclusion follows the declared setting. Same-day resets prevent overnight carry-forward.</li>
 <li>Duplicates, multi-price states, zeros, negative values and crossing are observations to diagnose. They are not automatic deletion rules. A median between candidates is a statistic, not necessarily an executable quote.</li>
 <li>Spread width is bid spread minus ask spread; negative width denotes crossing. A positive/negative target-level mean gap does not identify every dealer pair. Synchronization and size matching change the eligible population; compare the same slots before attributing an effect.</li>
@@ -251,8 +264,8 @@ def write_report(out, tables, comparisons=None, metadata=None):
 <li>Validation selection must precede final Test evaluation. This report does not certify an unexposed Test or choose a candidate from Test. Inspect split/selection/exposure provenance. LODO is descriptive removal of saved dates, not retraining, a confidence interval or significance.</li>
 <li>Local fixed-case CSVs may contain private dealer/bond identifiers. The generic comparison export is aggregate, but diagnostic bond/dealer tables and cases require review before sharing. No data from this run belongs in the shipped source repository by default.</li>
 </ul></section>'''
-    provenance_html = '<details><summary>Complete configuration and provenance</summary><pre>' + escape(json.dumps(provenance, ensure_ascii=False, indent=2)) + '</pre></details>'
-    document = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Raw quote research run</title><style>' + STYLE + '</style></head><body>'
+    provenance_html = '<details id="provenance"><summary>Complete configuration and provenance</summary><pre>' + escape(json.dumps(provenance, ensure_ascii=False, indent=2)) + '</pre></details>'
+    document = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Raw quote research run</title><style>' + STYLE + '</style></head><body class="analysis-report"><main>'
     target = output / 'report.html'
-    target.write_text(document + intro + ''.join(sections) + ''.join(model_sections) + limits + provenance_html + '</body></html>', encoding='utf-8')
+    target.write_text(document + intro + '<div id="diagnostics">'+''.join(sections)+'</div>' + ''.join(model_sections) + limits + provenance_html + '</main></body></html>', encoding='utf-8')
     return target

@@ -13,6 +13,7 @@ from .pipeline import run_research
 from .ingest import _times, _split
 from .training import assign_splits
 from bond_pricer.walk_forward import WalkForwardConfig
+from bond_pricer.ui_style import control as style_control, row, section, disclosure, hero, badge, table_html, style_root
 
 
 def _frame_columns(frame, label):
@@ -62,6 +63,7 @@ class ResearchForm:
         self._walk_forward = asdict(walk_forward) if isinstance(walk_forward, WalkForwardConfig) else dict(walk_forward or {})
         self._use_walk_forward = walk_forward is not None
         self.controls, self.run, self.running = {}, None, False
+        self._validated_control_state = self._run_control_state = None
         self.fold_preview, self._preview_token = pd.DataFrame(), None
         self.status, self.progress = w.HTML(), w.FloatProgress(min=0, max=1, value=0)
         self.fold_output = w.HTML()
@@ -71,11 +73,14 @@ class ResearchForm:
         self._make_settings(output, cache_dir)
         self._make_walk_forward_controls()
         self._make_widget()
+        for item in self.controls.values():
+            item.observe(self._form_changed,names='value')
+        self._form_changed()
 
     def _add(self, key, control):
         # UI LOGIC: Public named controls support notebook customization and simple programmatic checks.
-        control.style.description_width = '190px'
-        control.layout.width = 'min(100%, 650px)'
+        # UI LOGIC: Reuse the scoped stacked-label treatment without truncating source field descriptions.
+        style_control(control,wide=isinstance(control,(w.SelectMultiple,w.Textarea)))
         self.controls[key] = control
         return control
 
@@ -212,17 +217,16 @@ class ResearchForm:
     def _section(self, keys, note=''):
         # UI LOGIC: Sections are compact and expandable; long source tables are never printed.
         children = [w.HTML(note)] if note else []
-        return w.VBox(children+[self.controls[name] for name in keys])
+        return w.VBox(children+[row(*[self.controls[name] for name in keys])],layout=w.Layout(width='100%'))
 
     def _make_widget(self):
         # UI LOGIC: Explain caller responsibilities before exposing a potentially expensive run action.
-        intro = w.HTML('<h3>Raw quote research — spread data</h3><p>Supply prepared transaction and quote DataFrames, '
-            'BASE_FEATURES, BASE_CAT_FEATURES and LGB_PARAMS. Map columns below; no columns are guessed.</p>'
-            '<p><b>Your preparation:</b> load/filter the intended transaction universe and period; construct causal base '
-            'features; resolve identifiers, sector/issuer metadata, timestamps and benchmark-consistent spreads; '
-            'prepare any proxy, anchor and signed rollover adjustment. The engine does not build a proxy or combine '
-            'categorical features for you. Provide both categorical columns directly as base features when needed. '
-            'Sizes, spread units and timezones must be declared correctly. Prices are unsupported.</p>')
+        intro = hero('Raw quote research','Map prepared transactions and quotes, review validation settings, then run your research when ready.',
+            eyebrow='Spread research workbench',tags=(f'{len(self.transactions):,} transaction rows',f'{len(self.quotes):,} quote rows','Validation first'))
+        preparation = disclosure('Input preparation checklist',w.HTML('<p class="analysis-help">Prepare the intended transaction universe and period, causal '
+            'baseline features, aligned identifiers, sector/issuer metadata, timestamps and benchmark-consistent spreads. '
+            'Provide any proxy, anchor and signed rollover adjustment. Provide categorical columns directly as base features. '
+            'Declare sizes, spread units and timezones below; this form accepts spread data.</p>'))
         sections = [self._section([k for k in self.controls if k.startswith('tx_')],
                     'Required: bond, prediction time, target. Optional fields may stay (None).'),
             self._section(['quote_format']+[k for k in self.controls if k.startswith('quote_') and k not in
@@ -253,8 +257,17 @@ class ResearchForm:
                     'and masks OOF outcomes unavailable before the final selection origin. '
                     'Cost: four model fits per fold, then two development refits. Quote features are built once.'),
             self._section(['output', 'cache_dir'], 'Use a new run directory for changed settings. Completed matching stages reuse their cache.')]
+        tx_required = ['tx_bond','tx_time','tx_target']
+        sections[0] = w.VBox([self._section(tx_required,'Three required roles connect your transaction data to the engine.'),
+            disclosure('Optional transaction mappings',self._section([key for key in self.controls if key.startswith('tx_') and key not in tx_required]))],
+            layout=w.Layout())
+        quote_required = ['quote_format','quote_bond','quote_known_time','quote_dealer','quote_bid','quote_ask','quote_side','quote_value']
+        sections[1] = w.VBox([self._section(quote_required,'Wide quotes need a bid or ask spread. Long quotes need side and value. Known time records availability.'),
+            disclosure('Optional quote sizes and audit fields',self._section(['quote_quantity','quote_bid_size','quote_ask_size','quote_original_timestamp','quote_source_id']))],
+            layout=w.Layout())
         sections[5].children += (self.fold_output,)
         accordion = w.Accordion(children=sections, selected_index=0)
+        self.sections = accordion
         for index, title in enumerate(['1. Transactions', '2. Raw quotes', '3. Baseline model', '4. Units and quote settings',
                                        '5. Outer chronological split', '6. Optional walk forward', '7. Save and resume']):
             accordion.set_title(index, title)
@@ -269,8 +282,36 @@ class ResearchForm:
         self.start_button.on_click(self._start_clicked)
         self.review_button.on_click(self._review_clicked)
         self.status.value = 'Choose mappings, then Validate inputs. This checks structure and optional fold dates; it does not train.'
-        self.widget = w.VBox([intro, accordion, w.HBox([self.validate_button, self.start_button, self.review_button]),
-                              self.status, self.progress, self.review_output])
+        self.pending = w.HTML()
+        self.status.add_class('analysis-status')
+        self.progress.add_class('analysis-progress')
+        self.progress.layout.width = '100%'
+        self.progress.style.bar_color = '#0a7781'
+        self.progress.description = 'Ready'
+        actions = row(self.validate_button,self.start_button,self.review_button,self.pending).add_class('analysis-actions')
+        self.widget = style_root(w.VBox([intro,preparation,
+            section('Configure your research',accordion,note='Work through the sections in order. Advanced fields retain their values when collapsed.',step='01'),
+            section('Validate and run',actions,self.status,self.progress,
+                note='Validate inputs checks structure and previews optional fold dates. Run validation explicitly starts the configured research.',step='02'),
+            self.review_output]))
+
+    def _control_state(self):
+        # UI LOGIC: Snapshot literal form settings so badges describe the saved run separately from pending edits.
+        return tuple((name,item.value) for name,item in self.controls.items())
+
+    def _form_changed(self, change=None):
+        # UI LOGIC: Observing edits never trains, rebuilds features, validates data, or changes the saved run.
+        state = self._control_state()
+        if self.running:
+            self.pending.value = badge('Running · controls are locked','busy')
+        elif self.run is not None and state == self._run_control_state:
+            self.pending.value = badge('Saved run · settings match','ready')
+        elif state == self._validated_control_state:
+            self.pending.value = badge('Inputs checked · ready to run','ready')
+        elif self.run is not None:
+            self.pending.value = badge('Pending edits · saved review uses earlier settings','pending')
+        else:
+            self.pending.value = badge('Pending configuration · validate inputs','neutral')
 
     def configuration(self):
         # CONFIGURATION LOGIC: Keep explicit advanced settings; replace only fields editable in this form.
@@ -366,7 +407,7 @@ class ResearchForm:
             f'({4*count} fold fits + 2 development refits). '
             f'{len(development):,} development rows; {len(calendar)-len(development):,} rows reserved after outer Validation. '
             'Counts describe supplied rows, not verified finite-label support. Quotes/features are calculated once.'
-            '<div style="max-height:340px;overflow:auto">'+self.fold_preview.to_html(index=False, escape=True)+'</div>')
+            +table_html(self.fold_preview,title='Walk-forward fold plan'))
         self._preview_token = json.dumps([config.to_dict(), training.to_dict(), walk_forward.to_dict(),
             self.fold_preview.to_dict('records')], sort_keys=True)
         self.status.value += '<br><b>Fold preview ready.</b> Review the dates and fit budget in Optional walk forward before Run validation.'
@@ -415,6 +456,8 @@ class ResearchForm:
             raise ValueError('Choose an output directory.')
         self._show_mapping(config)
         self._preview_folds(config, training, walk_forward)
+        self._validated_control_state = self._control_state()
+        self._form_changed()
         return True
 
     def _validate_contracts(self, config, training):
@@ -457,7 +500,7 @@ class ResearchForm:
         # UI LOGIC: Progress is stage-local; do not imply a measured overall ETA from unknown aggregation work.
         self.status.value = '<b>'+escape(str(stage))+'</b>: '+escape(str(message))
         self.progress.value = min(1., max(0., current/total)) if current is not None and total else 0.
-        self.progress.description = str(stage)[:18]
+        self.progress.description = str(stage)
 
     def start(self):
         """Run validation explicitly; retain the returned run for review and later deliberate final-test use."""
@@ -465,6 +508,11 @@ class ResearchForm:
         if self.running:
             raise RuntimeError('A research run is already active in this form.')
         self.running = True
+        self.progress.value,self.progress.bar_style = 0.,''
+        for item in self.controls.values():
+            item.disabled = True
+        self.start_button.description = 'Running validation…'
+        self._form_changed()
         self.start_button.disabled = self.validate_button.disabled = self.review_button.disabled = True
         try:
             previous_preview = self._preview_token
@@ -478,6 +526,8 @@ class ResearchForm:
                 training=training, output=self.controls['output'].value.strip(),
                 cache_dir=self.controls['cache_dir'].value.strip() or None, progress=self._progress,
                 quote_universe=self.quote_universe, walk_forward=walk_forward, evaluate_test=False)
+            self._run_control_state = self._control_state()
+            self.progress.value,self.progress.bar_style,self.progress.description = 1.,'success','Complete'
             self.status.value = '<b>Validation complete.</b> Report: '+escape(str(self.run.report))+'. Final test has not been requested by this form.'
             return self.run
         except Exception as exc:
@@ -485,12 +535,17 @@ class ResearchForm:
             raise
         finally:
             self.running = False
+            for item in self.controls.values():
+                item.disabled = False
+            self.start_button.description = 'Run validation'
+            self._form_changed()
             self.start_button.disabled = self.validate_button.disabled = False
             self.review_button.disabled = self.run is None
 
     def _show_error(self, exc):
         # UI LOGIC: Escape source names and exception text rather than interpreting dataset content as HTML.
         self.status.value = '<b>Action required:</b> '+escape(str(exc))
+        self.progress.bar_style = 'warning'
 
     def _validate_clicked(self, button):
         # UI LOGIC: Notebook callbacks show concise inline errors; direct validate() still raises for callers/tests.

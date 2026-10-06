@@ -13,6 +13,8 @@ python -m jupyter lab raw_quote_research.ipynb
 
 [raw_quote_research.ipynb](raw_quote_research.ipynb) starts with clearly labelled synthetic inputs. Replace them with your prepared DataFrames, inspect the form, click **Validate inputs**, then **Run validation**. Running all cells alone does not train or open final test.
 
+The notebook forms use responsive sections, expandable advanced fields and badges that distinguish pending edits from saved results. Comparisons require **Apply**; exports use the last successful applied settings. HTML reviews share the same visual style, with section navigation, sticky table headers and scrollable full-resolution figures.
+
 For the existing BondCliQ files, use [bondcliq_research.ipynb](bondcliq_research.ipynb) and [its guide](docs/BONDCLIQ_EXAMPLE.md). Its source preparation and configuration are visible in notebook cells. The baseline now uses separate counterparty and side categories, giving 15 inputs; it does not replay historical BASE14 scores. There is no dataset-specific engine preset.
 
 ## DataFrame interface

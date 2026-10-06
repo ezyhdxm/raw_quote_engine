@@ -7,6 +7,7 @@ from pandas.api.types import is_numeric_dtype
 import ipywidgets as w
 from IPython.display import display
 from .data import read_data
+from .ui_style import control, row, section, disclosure, hero, badge, table_html, style_root
 from .engine import Comparison, compare_predictions
 from .slices import Slice, default_slices
 from . import plots
@@ -32,9 +33,8 @@ def _image(figure):
 def _preview(table):
     # UI LOGIC: Bound the on-screen table; complete tables remain in the export and public result API.
     columns = [c for c in ['group','x','y','n','reference_mae','candidate_mae','mae_improvement_pct','p95_delta','low_support'] if c in table]
-    shown = table.loc[:,columns].head(100)
-    note = f'<p>Showing {len(shown):,} of {len(table):,} groups. Export contains every group and metric.</p>'
-    return w.HTML(note+'<div style="max-height:420px;overflow:auto">'+shown.to_html(index=False,escape=True,float_format=lambda x:f'{x:.5g}')+'</div>')
+    shown = table.loc[:,columns]
+    return w.HTML(table_html(shown)+f'<p class="analysis-help">{len(table):,} total groups; export includes every group and metric.</p>')
 
 
 def _filter_text(condition):
@@ -56,6 +56,7 @@ class ComparisonPanel:
                  bond_column=None, error_scale=1, unit='bps', timezone='America/New_York',
                  default_slices=None, tolerance=1, reference_anchor=None, candidate_anchor=None):
         self.result, self.applied_specs, self.busy = None, None, False
+        self._applied_control_state = None
         self.supplied_slices = default_slices
         self.prediction_mapping = predictions
         self.anchors = dict(reference_anchor=reference_anchor,candidate_anchor=candidate_anchor)
@@ -99,26 +100,84 @@ class ComparisonPanel:
         self.applied = w.HTML()
         self.views = w.Tab(children=[w.HTML('Apply to calculate the common sample.')])
         self.views.set_title(0,'Results')
-        inputs = w.VBox([w.HBox([self.path,self.load]),w.HBox([self.actual,self.reference,self.candidate]),
-                         w.HBox([self.identity,self.time,self.bond]),w.HBox([self.scale,self.unit]),w.HBox([self.zone,self.tolerance])])
-        options = w.Accordion(children=[inputs])
-        options.set_title(0,'Data and prediction columns')
-        controls = w.VBox([w.HBox([self.first,self.second]),w.HBox([self.first_bins,self.first_right]),
-                           w.HBox([self.second_bins,self.second_right]),w.HBox([self.minimum,self.top_n,self.metric])])
-        self.widget = w.VBox([w.HTML('<h3>Bond pricer · Compare two models</h3><p>Choose a reference, candidate and slices. Negative error delta means improvement. Units must match before comparison.</p>'),
-                              options,controls,w.HTML('<b>Optional population filters</b> · two rows form an intersection; blank = no restriction'),
-                              *[item['widget'] for item in self.filters],self.apply,self.status,self.applied,self.views,
-                              w.HBox([self.export_path,self.export_button])])
+        self._make_widget()
         self.first.observe(lambda _:self.set_bins(self.first,self.first_bins,self.first_right),names='value')
         self.second.observe(lambda _:self.set_bins(self.second,self.second_bins,self.second_right),names='value')
         if self.data is not None:
             self.configure(actual,id_column,time_column,bond_column)
+        self._watch_controls()
+
+    def _make_widget(self):
+        # UI LOGIC: Present essential choices first and keep specialist settings in compact disclosures.
+        self.pending = w.HTML(badge('Ready to configure'))
+        data_inputs = section('Data and predictions',row(self.path,self.load),row(self.actual,self.reference,self.candidate),
+            disclosure('Identifiers, units and timestamp settings',row(self.identity,self.time,self.bond),
+                       row(self.scale,self.unit,self.zone,self.tolerance)),
+            note='Load a saved table, then choose the observed outcome and the two prediction columns.',step='01')
+        slice_controls = section('Choose the view',row(self.first,self.second,self.metric),row(self.minimum,self.top_n),
+            disclosure('Custom bin boundaries',row(self.first_bins,self.first_right),row(self.second_bins,self.second_right),
+                       w.HTML('<p class="analysis-help">Comma-separated edges, for example -inf, 0, 1, inf. Leave blank for unbinned groups.</p>')),
+            note='Negative candidate-minus-reference error deltas indicate improvement. Low-support groups remain visibly flagged.',step='02')
+        filters = disclosure('Optional population filters',*[item['widget'] for item in self.filters],
+            w.HTML('<p class="analysis-help">The two filter rows form an intersection. Blank conditions leave the population unrestricted.</p>'))
+        actions = row(self.apply,self.pending).add_class('analysis-actions')
+        self.status.add_class('analysis-status')
+        self.applied.add_class('analysis-applied')
+        self.views.layout.width = '100%'
+        self.views.children = [w.HTML('<div class="analysis-card-heading"><h3>Your review will appear here</h3>'
+            '<p>Choose your inputs and click Apply comparison. Results and exports retain the last successful applied configuration.</p></div>')]
+        self.views.set_title(0,'Results')
+        export = section('Save the applied review',row(self.export_path,self.export_button),
+                         note='Export figures, full tables and an HTML report using the last successful comparison.')
+        self.widget = style_root(w.VBox([hero('Compare bond spread predictions','Inspect a reference and candidate on the same trades, then explore where spread errors improve or deteriorate.',
+            tags=('Saved predictions','Explicit Apply','Portable review')),data_inputs,slice_controls,filters,
+            actions,self.status,self.applied,self.views,export]))
+        for item in [self.path,self.export_path]:
+            control(item,wide=True)
+
+    def _watch_controls(self):
+        # UI LOGIC: Edits only update a badge; expensive work remains behind the explicit Apply button.
+        names = ['actual','reference','candidate','identity','time','bond','scale','unit','zone','tolerance',
+                 'first','second','first_bins','second_bins','first_right','second_right','minimum','top_n','metric']
+        self._pending_controls = [getattr(self,name) for name in names]
+        self._pending_controls += [item[key] for item in self.filters for key in ['column','low','high','strict','categories']]
+        for item in self._pending_controls:
+            control(item,wide=item is self.metric)
+            item.observe(self._pending_changed,names='value')
+        self._pending_changed()
+
+    def _control_state(self):
+        # UI LOGIC: Compare literal widget values plus the loaded-table identity; export-path edits are independent.
+        return (id(self.data),tuple(item.value for item in self._pending_controls))
+
+    def _pending_changed(self, change=None):
+        # UI LOGIC: Reverting every edit restores the applied badge without recalculating anything.
+        if self.busy:
+            self.pending.value = badge('Working · controls are locked','busy')
+        elif self._applied_control_state is None:
+            self.pending.value = badge('Not applied · choose inputs and Apply','neutral')
+        elif self._control_state() != self._applied_control_state:
+            self.pending.value = badge('Pending changes · Apply to update results','pending')
+        else:
+            self.pending.value = badge('Applied · results match these controls','ready')
+
+    def _set_busy(self, busy, *, exporting=False):
+        # UI LOGIC: Lock mutable inputs while an explicit action runs and restore the existing result afterward.
+        self.busy = busy
+        self.apply.disabled = self.load.disabled = busy
+        self.export_button.disabled = busy or self.result is None
+        for item in self._pending_controls:
+            item.disabled = busy
+        self.apply.description = 'Comparing…' if busy and not exporting else 'Apply comparison'
+        self.export_button.description = 'Exporting…' if busy and exporting else 'Export applied review'
+        self._pending_changed()
 
     def make_filter(self):
         # UI LOGIC: Two optional filters cover common large-trade × maturity/sparsity reviews.
         fields = dict(column=w.Dropdown(description='Column:'),low=w.Text(description='Lower:'),high=w.Text(description='Upper:'),
                       strict=w.Checkbox(value=False,description='Strict lower >'),categories=w.Text(description='Values:',placeholder='A; B; C (optional)'))
-        fields['widget'] = w.VBox([w.HBox([fields['column'],fields['low'],fields['high']]),w.HBox([fields['strict'],fields['categories']])])
+        fields['widget'] = w.VBox([row(fields['column'],fields['low'],fields['high']),row(fields['strict'],fields['categories'])],
+                                   layout=w.Layout())
         return fields
 
     def configure(self, actual=None, identity=None, time=None, bond=None):
@@ -174,6 +233,9 @@ class ComparisonPanel:
 
     def load_data(self, _=None):
         # FILE IO LOGIC: Replace the input only on an explicit load; preserve the applied result on error.
+        self._set_busy(True)
+        self.load.description = 'Loading…'
+        self.status.value = 'Loading the selected table…'
         try:
             data = read_data(self.path.value, string_columns='all')
             self.data = data
@@ -184,6 +246,9 @@ class ComparisonPanel:
             self.configure()
         except Exception as exc:
             self.status.value = '<b>Input error:</b> '+escape(str(exc))
+        finally:
+            self.load.description = 'Load data'
+            self._set_busy(False)
 
     def specs(self):
         # CONFIGURATION LOGIC: Snapshot the currently requested boundaries, names and closure.
@@ -204,7 +269,7 @@ class ComparisonPanel:
         # UI LOGIC: Publish result state only after a successful computation; previous exports remain valid.
         if self.busy:
             return
-        self.busy, self.apply.disabled = True, True
+        self._set_busy(True)
         self.status.value = 'Comparing saved predictions on common rows...'
         try:
             if self.data is None:
@@ -233,13 +298,14 @@ class ComparisonPanel:
             title = f'{candidate} vs {reference} | {first.column}'+(f' × {second.column}' if second else '')
             chart = plots.heatmap(table,self.metric.value,unit=result.unit,title=title) if second else plots.slice_figure(table,self.metric.value,unit=result.unit,title=title)
             self.views.children = [_image(plots.overview(result)),w.VBox([_image(chart),_preview(table)]),
-                                   w.VBox([_image(plots.daily_figure(result.daily(),unit=result.unit)),w.HTML(result.stability().to_html(index=False,escape=True))]),
-                                   w.HTML(result.missingness().to_html(index=False,escape=True))]
+                                   w.VBox([_image(plots.daily_figure(result.daily(),unit=result.unit)),w.HTML(table_html(result.stability(),title='Leave-one-date-out sensitivity'))]),
+                                   w.HTML(table_html(result.missingness(),title='Input missingness'))]
             for i,label in enumerate(['Overview','Slices','Dates','Missingness']):
                 self.views.set_title(i,label)
             self.result,self.applied_specs = result,(first,second)
             self.applied_filters,self.applied_min_count = result.filter_history,self.minimum.value
             self.applied_metric = self.metric.value
+            self._applied_control_state = self._control_state()
             self.export_button.disabled = False
             population = '; '.join(_filter_text(f) for f in result.filter_history) or 'All supplied trades'
             self.applied.value = '<b>Applied:</b> '+escape(title)+f' | {len(result.rows):,} paired trades<br><b>Population:</b> '+escape(population)
@@ -247,12 +313,13 @@ class ComparisonPanel:
         except Exception as exc:
             self.status.value = '<b>Comparison error:</b> '+escape(str(exc))+' Previous applied result is unchanged.'
         finally:
-            self.busy,self.apply.disabled = False,False
+            self._set_busy(False)
 
     def export(self, _=None):
         # FILE IO LOGIC: Export the applied data/specifications, never newly edited but unapplied controls.
         if self.result is None or self.busy:
             return
+        self._set_busy(True,exporting=True)
         try:
             first,second = self.applied_specs
             output = self.result.export(self.export_path.value,slices=[first],interactions=[(first,second)] if second else [],
@@ -260,6 +327,8 @@ class ComparisonPanel:
             self.status.value = 'Saved complete PNG, CSV and HTML review to '+escape(str(output))
         except Exception as exc:
             self.status.value = '<b>Export error:</b> '+escape(str(exc))
+        finally:
+            self._set_busy(False)
 
     def show(self):
         # UI LOGIC: Display one workbench instance; the user explicitly applies a comparison.

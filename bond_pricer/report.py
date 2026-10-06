@@ -10,16 +10,33 @@ import numpy as np
 import pandas as pd
 from .slices import Slice
 from . import plots
+from .ui_style import REPORT_STYLE
 
-STYLE = '''body{max-width:1120px;margin:35px auto;padding:0 22px;font:16px/1.65 system-ui;color:#183541}
-h1,h2{line-height:1.3}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:8px;border:1px solid #d5e0e4;text-align:left}
-th{background:#edf4f5}.table{overflow:auto}img{max-width:100%}.note{background:#edf7f5;padding:16px;border-left:4px solid #18807d}
-code{overflow-wrap:anywhere}a{color:#097986}section{margin:32px 0}details{margin:15px 0}'''
+# UI LOGIC: Shared report selectors stay inside the report body; wide figures retain a readable display scale.
+STYLE = REPORT_STYLE + '''
+.analysis-report .plot-scroll{overflow-x:auto;max-width:100%;border:1px solid #e0e8ef;border-radius:10px;margin:16px 0;background:#fff}
+.analysis-report .plot-scroll img{width:100%;max-width:none;margin:0;height:auto}
+.analysis-report .figure-link{font-size:12px;margin-top:5px;color:#52697f}
+.analysis-report .note{padding:16px 18px;background:#edf6f8;border-left:4px solid #217d88;border-radius:7px;color:#29485d}
+.analysis-report pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f2f6fa;border:1px solid #dce5ee;border-radius:8px;padding:16px;font-size:12px}
+.analysis-report section{scroll-margin-top:18px}
+@media print{.analysis-report .plot-scroll{overflow:visible}.analysis-report .plot-scroll img{min-width:0!important;max-width:100%}}
+'''
 
 
 def _table(frame):
     # FORMATTING LOGIC: Exact machine-readable values are exported separately; HTML is rounded for reading.
-    return '<div class="table">'+frame.to_html(index=False,escape=True,float_format=lambda x:f'{x:,.5g}')+'</div>'
+    return '<div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable results table">'+frame.to_html(
+        index=False,escape=True,border=0,float_format=lambda x:f'{x:,.5g}')+'</div>'
+
+
+def _figure(figure, output, filename, alt):
+    # PLOTTING LOGIC: Keep the complete PNG and a readable minimum width for dense or narrow reviews.
+    figure.savefig(output/filename,dpi=160)
+    minimum = max(760,round(figure.get_figwidth()*80))
+    return (f'<div class="plot-scroll" tabindex="0" role="region" aria-label="Scrollable figure"><img src="{filename}" '
+            f'alt="{escape(alt)}" style="min-width:{minimum}px"></div>'
+            f'<p class="figure-link"><a href="{filename}">Open full-size figure</a> · Scroll horizontally when the figure exceeds this pane.</p>')
 
 
 def _json(value):
@@ -57,17 +74,19 @@ def export_comparison(comparison, folder, slices=None, interactions=None, min_co
     tables = {'summary':comparison.summary(min_count), 'daily':comparison.daily(min_count),
               'date_sensitivity':comparison.stability(), 'missingness':comparison.missingness()}
     # PLOTTING LOGIC: Overview and complete date history are exported at full resolution.
-    plots.overview(comparison).savefig(output/'overview.png',dpi=160)
-    plots.daily_figure(tables['daily'],unit=comparison.unit).savefig(output/'daily.png',dpi=160)
-    sections = ['<h2>Common-sample overview</h2>'+_table(tables['summary'])+'<img src="overview.png" alt="Common-sample metrics and coverage">']
+    overview = _figure(plots.overview(comparison),output,'overview.png','Common-sample metrics and coverage')
+    daily = _figure(plots.daily_figure(tables['daily'],unit=comparison.unit),output,'daily.png','Daily losses')
+    sections = ['<section id="overview"><h2>Common-sample overview</h2>'+_table(tables['summary'])+overview+'</section>']
+    navigation = [('coverage','Coverage'),('overview','Overview')]
     # REPORTING LOGIC: Build every requested slice from the same result object used in the notebook.
     for i,spec in enumerate(specs):
         key = f'slice_{i+1:02d}'
         table = comparison.slice(spec,min_count=min_count)
         tables[key] = table
         title = spec.name or spec.column
-        plots.slice_figure(table,metric,unit=comparison.unit,title=title).savefig(output/f'{key}.png',dpi=160)
-        sections.append(f'<h2>{escape(title)}</h2><img src="{key}.png" alt="Slice loss and support"><details><summary>Complete table</summary>'+_table(table)+'</details>')
+        figure = _figure(plots.slice_figure(table,metric,unit=comparison.unit,title=title),output,f'{key}.png','Slice loss and support')
+        sections.append(f'<section id="{key}"><h2>{escape(title)}</h2>'+figure+'<details><summary>Complete table</summary>'+_table(table)+'</details></section>')
+        navigation.append((key,title))
     # REPORTING LOGIC: Cross tables preserve every observed cell and its support.
     for i,pair in enumerate(interactions):
         sx,sy = [s if isinstance(s,Slice) else Slice(s) for s in pair]
@@ -75,8 +94,10 @@ def export_comparison(comparison, folder, slices=None, interactions=None, min_co
         table = comparison.cross_slice(sx,sy,min_count=min_count)
         tables[key] = table
         if not table.empty:
-            plots.heatmap(table,metric,unit=comparison.unit,title=f'{sx.column} × {sy.column}').savefig(output/f'{key}.png',dpi=160)
-            sections.append(f'<h2>{escape(sx.column)} × {escape(sy.column)}</h2><img src="{key}.png" alt="Loss and count heatmaps">'+_table(table))
+            label = f'{sx.column} × {sy.column}'
+            figure = _figure(plots.heatmap(table,metric,unit=comparison.unit,title=label),output,f'{key}.png','Loss and count heatmaps')
+            sections.append(f'<section id="{key}"><h2>{escape(label)}</h2>'+figure+_table(table)+'</section>')
+            navigation.append((key,label))
     # FILE IO LOGIC: Lossless CSV tables and the explicit review configuration accompany the figures.
     for name,table in tables.items():
         table.to_csv(output/f'{name}.csv',index=False)
@@ -90,13 +111,16 @@ def export_comparison(comparison, folder, slices=None, interactions=None, min_co
     (output/'review.json').write_text(json.dumps(_portable(manifest),allow_nan=False,indent=2),encoding='utf-8')
     # REPORTING LOGIC: State denominators, signs and descriptive limitations next to the generated evidence.
     title = f'{comparison.candidate_name} vs {comparison.reference_name}'
-    intro = f'<h1>{escape(title)}</h1><p>Errors in {escape(comparison.unit)}. Record-weighted metrics on common finite targets and predictions.</p>'
+    intro = f'<header class="hero"><div class="eyebrow">Saved prediction review</div><h1>{escape(title)}</h1>'
+    intro += f'<p>Errors in {escape(comparison.unit)}. Record-weighted metrics on common finite targets and predictions.</p></header>'
+    navigation.append(('dates','Dates and sensitivity'))
+    intro += '<nav aria-label="Report sections">'+''.join(f'<a href="#{key}">{escape(label)}</a>' for key,label in navigation)+'</nav>'
     intro += '<p class="note">Negative MAE/P95 delta means improvement; positive MAE improvement % means improvement. '
     intro += 'Sparse cells are flagged, never removed. Slices are descriptive, overlap, and must not be added together. '
     intro += 'Date sensitivity is not a confidence interval. Repeated test inspection is not fresh validation.</p>'
-    intro += '<h2>Coverage</h2><pre>'+escape(json.dumps(comparison.coverage,indent=2))+'</pre>'
-    tail = '<h2>Dates and sensitivity</h2><img src="daily.png" alt="Daily losses">'+_table(tables['date_sensitivity'])
-    tail += '<p><a href="review.json">Configuration and data fingerprint</a> · <a href="summary.csv">Exact summary</a></p>'
-    document = '<!doctype html><html lang="en"><meta charset="utf-8"><title>'+escape(title)+'</title><style>'+STYLE+'</style><body>'
-    (output/'report.html').write_text(document+intro+''.join('<section>'+s+'</section>' for s in sections)+tail+'</body></html>',encoding='utf-8')
+    intro += '<section id="coverage"><h2>Coverage</h2><pre>'+escape(json.dumps(comparison.coverage,indent=2))+'</pre></section>'
+    tail = '<section id="dates"><h2>Dates and sensitivity</h2>'+daily+_table(tables['date_sensitivity'])
+    tail += '<p><a href="review.json">Configuration and data fingerprint</a> · <a href="summary.csv">Exact summary</a></p></section>'
+    document = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+escape(title)+'</title><style>'+STYLE+'</style></head><body class="analysis-report"><main>'
+    (output/'report.html').write_text(document+intro+''.join(sections)+tail+'</main></body></html>',encoding='utf-8')
     return output
